@@ -7,7 +7,9 @@ status == "verified" AND final_error == "" (a "verified" record with a non-empty
 internal crash, not a verification). Every such record is scored, duplicates included.
 
 Scoring (identical for every unit):
-  suite     benchmarks/<bench dir>/<bench>_v2_eval.json: 10 evaluation pairs + the evaluation T- per task
+  suite     benchmarks/<bench dir>/<bench>_v2_eval.json: 10 evaluation pairs + the evaluation T- per task;
+            --pairs N scores only the first N pairs of the ranked list (T8 chooses N; default: all 10).
+            A result keeps every pair's verdicts, so collect.py --pairs M (M <= N) re-scores any prefix.
   harness   spec_harness.eval_llm_response.evaluate_problem, dual accept/refute decisions (D8), OpenJML ESC
             with the RQ1 command, 300 s per decision, exclude_collection_tasks=False (D3)
   JVMs      at most --jvm-slots OpenJML JVMs at once (2 per decision), timers start at launch
@@ -83,7 +85,7 @@ def strip_stubs(res: dict) -> dict:
 
 def score_unit(ev, suite: dict, u: dict, args, info: dict) -> dict:
     rec = {k: u[k] for k in ("unit", "file", "task_id", "approach", "bench", "model", "prompt")}
-    rec.update(provenance=info, started=C.now(), suite=os.path.basename(SUITES[u["bench"]]))
+    rec.update(provenance=info, started=C.now(), suite=os.path.basename(SUITES[u["bench"]]), pairs=args.pairs)
     task = suite.get(u["task_id"])
     if task is None:
         rec["status"] = "task_not_in_suite"
@@ -94,7 +96,7 @@ def score_unit(ev, suite: dict, u: dict, args, info: dict) -> dict:
     try:
         res = ev.evaluate_problem(task=ev.Task.from_dict(task), llm_code=u["final_code"],
                                   openjml_path=args.openjml, output_dir=work, verbose=False,
-                                  max_pairs=0, exclude_collection_tasks=False)
+                                  max_pairs=args.pairs, exclude_collection_tasks=False)
         rec["seconds"] = round(time.time() - t0, 1)
         if not res:
             rec["status"] = "no_pairs_parsed"
@@ -138,6 +140,12 @@ def cmd_run(args) -> int:
                 continue
         todo.append(u)
     suites = {b: {t["task_id"]: t for t in json.load(open(SUITES[b]))} for b in args.bench}
+    meta_p = os.path.join(args.out, "run_meta.json")
+    if os.path.exists(meta_p):                          # a resumed run must keep its pair count
+        old = json.load(open(meta_p)).get("args", {}).get("pairs", 0)
+        if old != args.pairs:
+            C.log(f"ERROR: {args.out} was run with --pairs {old}, not {args.pairs}; use another --out")
+            return 2
     info = C.bundle_info()
     C.atomic_json(os.path.join(args.out, "run_meta.json"),
                   {"rq": "RQ3", "args": {k: v for k, v in vars(args).items() if k != "func"}, "provenance": info,
@@ -235,6 +243,8 @@ def main() -> int:
             p.add_argument("--limit", type=int, default=0, help="first N units per file (smoke tests)")
             p.add_argument("--units-file", default=None, help="only these unit ids (<file stem>/<task>), one per line")
             p.add_argument("--keep-stubs", choices=["tar", "none"], default="tar")
+            p.add_argument("--pairs", type=int, default=0,
+                           help="score the first N evaluation pairs of the suite (0 = all; T8 chooses N)")
             p.add_argument("--force", action="store_true")
             p.add_argument("--retry-errors", action="store_true")
             p.add_argument("--stale-hours", type=float, default=12.0)

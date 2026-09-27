@@ -264,7 +264,7 @@ def cmd_score(args) -> int:
         if not C.try_lock(lock, args.stale_hours):
             return tid, "locked"
         rec = {"arm": arm, "agent": agent, "bench": bench, "task_id": tid, "solution": sol, "provenance": info,
-               "started": C.now()}
+               "pairs": args.pairs, "started": C.now()}
         work_dir = os.path.join(args.out, "work", arm, f"{agent}_{bench}", tid)
         try:
             if not sol:
@@ -296,7 +296,7 @@ def cmd_score(args) -> int:
                     t1 = time.time()
                     h = ev.evaluate_problem(task=ev.Task.from_dict(evals[bench][tid]), llm_code=code,
                                             openjml_path=args.openjml, output_dir=os.path.join(work_dir, "stubs"),
-                                            verbose=False, max_pairs=0, exclude_collection_tasks=False)
+                                            verbose=False, max_pairs=args.pairs, exclude_collection_tasks=False)
                     rec["harness_seconds"] = round(time.time() - t1, 1)
                     rec["status"] = "scored" if h else "no_pairs_parsed"
                     if h:
@@ -389,6 +389,8 @@ def main() -> int:
             p.add_argument("--veriact-model", default="gpt-5.4")
         if name == "score":
             p.add_argument("--workers", type=int, default=0, help="tasks in flight (default: jvm-slots / 2)")
+            p.add_argument("--pairs", type=int, default=0,
+                           help="score the first N evaluation pairs (0 = all 10; T8 chooses N)")
             p.add_argument("--stale-hours", type=float, default=12.0)
     a = ap.parse_args()
     a.out = os.path.abspath(a.out)

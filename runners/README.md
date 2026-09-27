@@ -45,6 +45,7 @@ python runners/rq3_run.py status --out /data/rq3_out
 - **Stopping:** Ctrl-C, `kill <pid>` or closing the screen stops the runner **and** every OpenJML/cvc4 process it started. A task interrupted mid-way is not saved.
 - **Resumable:** re-run the same command after any interruption; finished units are skipped.
 - **Splitting:** `--shard i/n` splits the work over several machines or sessions; `--bench sgb` / `--bench fb` works too. Two machines: `--shard 0/2` on one and `--shard 1/2` on the other, each with its own `--out`; `collect.py` merges them.
+- **Pairs:** `--pairs N` scores the first N evaluation pairs (T8 chooses N; default: all 10). The run directory remembers N, and a resume with another N is refused. `collect.py rq3 --pairs M` re-scores any prefix M ≤ N, e.g. to merge machines that used different N.
 - **Slots:** about one core per slot (the JVM waits while cvc4 solves). Leave headroom, e.g. `--jvm-slots 96` on a 112-core machine with nothing else running; contention pushes decisions into the 300 s timeout (verdict unknown).
 - **Output:** `results/<file>/<task>.json`, `stubs/<file>/<task>.tar.gz`, `progress.log` (with ETA) and `run_meta.json`.
 

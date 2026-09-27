@@ -4,6 +4,8 @@ Collect RQ3 / RQ4 results from one or more machines into CSVs (figures are gener
 
   python runners/collect.py rq3 --in m1/rq3_out [m2/rq3_out ...] --out results/rq3
   python runners/collect.py rq4 --in m2/rq4_out m3/rq4_out --out results/rq4
+  --pairs N  re-scores every result from its first N evaluation pairs (e.g. machines scored with 10 and with
+             the T8-chosen N: collect both with --pairs N)
 
 rq3 writes
   rq3_per_spec.csv       one row per RQ1 spec (all machines merged)
@@ -67,17 +69,42 @@ def meets(r: dict, m: str, t: float) -> bool:
     return x != "" and float(x) >= t
 
 
+PAIRS = 0          # --pairs N: re-score every result from its first N evaluation pairs (0 = as scored)
+
+
 def metric_values(rec: dict) -> dict:
     """metric -> score (float) or None (not evaluable)."""
     h = rec.get("harness") or {}
     if h.get("integrity_failed") or h.get("no_postcondition"):
         return {m: 0.0 for m in METRICS}
+    if PAIRS:
+        from spec_harness.score_subsets import at_n
+        return {m: v["score"] for m, v in at_n(h, PAIRS).items()}
     out = {}
     for m in METRICS:
         x = h.get(m) or {}
         ev = x.get("evaluable", (x.get("total") or 0) > 0)
         out[m] = float(x["score"]) if ev and x.get("score") is not None else None
     return out
+
+
+def post_all_unknown(rec: dict):
+    """True if every post check is undecided (at --pairs N: among the first N pairs)."""
+    h = rec.get("harness") or {}
+    if not PAIRS or h.get("integrity_failed") or h.get("no_postcondition"):
+        return h.get("post_all_unknown", "")
+    from spec_harness.score_subsets import at_n
+    pc = at_n(h, PAIRS)["post_correctness"]
+    return pc["decided"] == 0 and pc["unknown"] > 0
+
+
+def check_pairs(recs: dict) -> None:
+    """--pairs N needs results scored with at least N pairs (pairs 0 = all of the suite's, >= 10)."""
+    if not PAIRS:
+        return
+    few = [k for k, r in recs.items() if r.get("status") == "scored" and 0 < (r.get("pairs") or 0) < PAIRS]
+    if few:
+        raise SystemExit(f"--pairs {PAIRS}: {len(few)} results were scored with fewer pairs, e.g. {few[:3]}")
 
 
 def write_csv(path, rows):
@@ -114,6 +141,7 @@ def cmd_rq3(a) -> int:
     seen, conflicts = merge(a.inputs, os.path.join("results", "*", "*.json"), lambda r: r["unit"], a.out)
     expected = {u["unit"]: u for u in rq3_run.units(a.rq1_dir, ["sgb", "fb"], None, 0)}
     recs = {k: json.load(open(p)) for k, p in seen.items()}
+    check_pairs(recs)
     rows = []
     for unit in sorted(recs):
         r = recs[unit]
@@ -122,7 +150,7 @@ def cmd_rq3(a) -> int:
         row = {k: r.get(k, "") for k in ("unit", "file", "approach", "bench", "model", "prompt", "task_id", "status")}
         row.update(integrity_failed=h.get("integrity_failed", False),
                    no_postcondition=h.get("no_postcondition", False), excluded=h.get("excluded", ""),
-                   exclude_reason=h.get("exclude_reason", ""), post_all_unknown=h.get("post_all_unknown", ""))
+                   exclude_reason=h.get("exclude_reason", ""), post_all_unknown=post_all_unknown(r))
         for m in METRICS:
             x = h.get(m) or {}
             row[SHORT[m]] = "" if v[m] is None else v[m]
@@ -215,6 +243,7 @@ def cmd_rq4(a) -> int:
     seen, conflicts = merge(a.inputs, os.path.join("*", "_scores", "*", "*.json"),
                             lambda r: f"{r['arm']}/{r['agent']}_{r['bench']}/{r['task_id']}", a.out)
     recs = {k: json.load(open(p)) for k, p in seen.items()}
+    check_pairs(recs)
     rows = []
     for k in sorted(recs):
         r = recs[k]
@@ -222,7 +251,7 @@ def cmd_rq4(a) -> int:
         h = r.get("harness") or {}
         row = {x: r.get(x, "") for x in ("arm", "agent", "bench", "task_id", "status", "verified")}
         row.update(integrity_failed=h.get("integrity_failed", False),
-                   no_postcondition=h.get("no_postcondition", False), post_all_unknown=h.get("post_all_unknown", ""))
+                   no_postcondition=h.get("no_postcondition", False), post_all_unknown=post_all_unknown(r))
         for m in METRICS:
             row[SHORT[m]] = "" if v[m] is None else v[m]
         row.update(host=(r.get("provenance") or {}).get("host", ""), bundle=(r.get("provenance") or {}).get("bundle", ""))
@@ -269,12 +298,18 @@ def main() -> int:
     p3.add_argument("--in", dest="inputs", nargs="+", required=True)
     p3.add_argument("--out", required=True)
     p3.add_argument("--rq1-dir", default=os.path.join(C.REPO, "inputs", "rq1"))
+    p3.add_argument("--pairs", type=int, default=0,
+                    help="re-score from the first N evaluation pairs (results must have >= N; 0 = as scored)")
     p3.set_defaults(func=cmd_rq3)
     p4 = sub.add_parser("rq4")
     p4.add_argument("--in", dest="inputs", nargs="+", required=True)
     p4.add_argument("--out", required=True)
+    p4.add_argument("--pairs", type=int, default=0,
+                    help="re-score from the first N evaluation pairs (results must have >= N; 0 = as scored)")
     p4.set_defaults(func=cmd_rq4)
     a = ap.parse_args()
+    global PAIRS
+    PAIRS = a.pairs
     return a.func(a)
 
 
