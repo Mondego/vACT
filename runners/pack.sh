@@ -2,7 +2,8 @@
 # Build the portable bundle for the RQ3 / RQ4 machines (run on the reference machine AFTER the test-set
 # build and after vACT-phase0 has been reviewed and committed, fse_todo A7).
 #   runners/pack.sh [output-dir]      -> <output-dir>/spec_harness_bundle_<commit>_<date>.tar.gz
-# Contents: the vACT-phase0 snapshot (code + v2 suites), inputs/rq1 (slim RQ1 files), requirements.txt,
+# Contents: the committed vACT-phase0 tree at HEAD (git archive; never untracked/ignored files such as config/.env),
+# inputs/rq1 (slim RQ1 files), requirements.txt,
 # BUNDLE_MANIFEST.sha256 (every result records its hash). OpenJML is NOT included: every machine has
 # `openjml` (21-0.21) on PATH.
 set -euo pipefail
@@ -11,11 +12,13 @@ ROOT="$(cd "$REPO/.." && pwd)"
 OUT="${1:-$ROOT/bundles}"
 COMMIT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo nogit)"
 DIRTY="$(git -C "$REPO" status --porcelain 2>/dev/null | wc -l)"
-if [ "$DIRTY" != "0" ]; then echo "WARNING: vACT-phase0 has $DIRTY uncommitted changes (A7: review and commit first)"; fi
+if [ "$DIRTY" != "0" ]; then echo "NOTE: $DIRTY uncommitted change(s) are NOT in the bundle; it is built from commit $COMMIT"; fi
 NAME="spec_harness_bundle_${COMMIT}_$(date +%Y%m%d)"
 STAGE="$(mktemp -d)/$NAME"
 mkdir -p "$STAGE" "$OUT"
-rsync -a --exclude .git --exclude __pycache__ --exclude '*.pyc' --exclude 'rq3_out' --exclude 'rq4_out' "$REPO/" "$STAGE/"
+# exactly the committed tree (HEAD): no untracked or ignored files, so no secrets (config/.env) and no caches
+git -C "$REPO" archive --format=tar HEAD | tar -x -C "$STAGE"
+if find "$STAGE" -name ".env" | grep -q .; then echo "ERROR: a .env file would be packaged"; exit 1; fi
 for f in sgb_v2_eval sgb_v2_feedback; do test -s "$STAGE/benchmarks/specgenbench/$f.json" || { echo "missing suite $f"; exit 1; }; done
 for f in fb_v2_eval fb_120_v2_eval fb_120_v2_feedback; do test -s "$STAGE/benchmarks/formalbench/$f.json" || { echo "missing suite $f"; exit 1; }; done
 test -s "$STAGE/runners/reference/smoke_verdicts.json" || { echo "missing runners/reference/smoke_verdicts.json (run preflight --record-reference)"; exit 1; }
