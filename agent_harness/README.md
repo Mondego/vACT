@@ -35,8 +35,11 @@ Both benchmarks are already the final 120-task sets (`fb_120.json` is the
 category-matched FormalBench sample), so scaffold loads them identically — no
 sampling step.
 
-Each task dir gets exactly **5** IO pairs: from `test_inputs` first, topped up from
-`generated_test_cases` (same selection the harness scores with `max_pairs=5`).
+Each task dir gets **10** IO pairs (`MAX_PAIRS`): from `test_inputs` first, topped up from
+`generated_test_cases` (the same selection the harness tool scores with `max_pairs=10`). Scaffold from a
+`*_v2_feedback.json` benchmark: its `test_inputs` are the T5 feedback list, disjoint from the evaluation
+pairs of `*_v2_eval.json` used for final scoring; its `invalid_inputs` (validated T-) are carried into
+`harness/task.json` and used for PreComp.
 
 ### Attempt budget (stopping criterion)
 
@@ -184,3 +187,18 @@ agent_harness/
 > `templates/verifier_tool.py` are verbatim copies of the same-named files in
 > `veriact/`. If those change while this package still lives in the VeriAct repo,
 > re-copy them. Once split into its own repo, `templates/` is the source of truth.
+
+## What gets recorded (per task, under `<task>/harness/`)
+
+| File | Content |
+|---|---|
+| `agent_run.log` | The agent's stdout as structured events. `run_agents.py` enforces `--output-format stream-json --verbose` for Claude Code and `exec --json` for Codex, even with a custom `--cmd`. |
+| `agent_stderr.log` | The agent's stderr, kept separate so the event log stays parseable. |
+| `codex_rollout.jsonl` | Codex only: the full session rollout copied from `$CODEX_HOME/sessions` (complete conversation, reasoning items, cumulative token counts). |
+| `run_meta.json` | Command (prompt elided), CLI version, model, host, start/end, wall time, exit code, timeout, hashes of `AGENTS.md` and the vendored tools, attempts used. |
+| `tool_calls.jsonl` | One line per `verify` / `harness` / `submit` call, written by the tools themselves: timestamps, duration, the exact `Solution.java` snapshot and hash, the full output, and the budget state. Offline scoring (`--no-budget`) is marked `offline: true`. |
+| `previous_runs/<timestamp>/` | Earlier sessions of the same task; nothing is overwritten. |
+
+`run_agents.py --fresh` archives the previous run's state (attempt counter, scores, submission, edited `Solution.java`) and restores the original code, so a re-run starts clean.
+
+Summarize a run with `python usage_report.py` (in the out-root, or `--root <dir>`). It writes `usage_per_task.csv` and `usage_summary.json`: tokens (input, cached, output, reasoning), cost where the CLI reports it, wall time, turns, and tool calls. It works on Claude Code / Codex out-roots and on VeriAct run dirs.

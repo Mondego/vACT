@@ -63,8 +63,8 @@ def collect(score_missing: bool = False) -> list[dict]:
             if scored:
                 scores = scored
                 data["passed"] = (
-                    scored.get("post_correctness", 0.0) >= THRESHOLD
-                    and scored.get("post_completeness", 0.0) >= THRESHOLD
+                    (scored.get("post_correctness") or 0.0) >= THRESHOLD
+                    and (scored.get("post_completeness") or 0.0) >= THRESHOLD
                 )
         row = {
             "task_id": data.get("task_id", name),

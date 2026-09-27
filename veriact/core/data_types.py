@@ -30,6 +30,7 @@ class Task:
     test_code: str = ""
     test_inputs: list[TestCase] = field(default_factory=list)
     generated_test_cases: list[TestCase] = field(default_factory=list)
+    invalid_inputs: list[dict] | None = None      # validated T- (testset T6); None -> heuristic
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Task":
@@ -46,4 +47,5 @@ class Task:
             generated_test_cases=[
                 TestCase.from_dict(tc) for tc in data.get("generated_test_cases", [])
             ],
+            invalid_inputs=data.get("invalid_inputs"),
         )

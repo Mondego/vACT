@@ -1,0 +1,82 @@
+#
+# This file contains the mapping from manual tags to classes.  It may
+# not contain any blank lines.
+#
+#
+#
+# Binary operator tags:
+#
+OR		javafe.ast.BinaryExpr
+AND		javafe.ast.BinaryExpr
+BITOR		javafe.ast.BinaryExpr
+BITXOR		javafe.ast.BinaryExpr
+BITAND		javafe.ast.BinaryExpr
+NE		javafe.ast.BinaryExpr
+EQ		javafe.ast.BinaryExpr
+GE		javafe.ast.BinaryExpr
+GT		javafe.ast.BinaryExpr
+LE		javafe.ast.BinaryExpr
+LT		javafe.ast.BinaryExpr
+LSHIFT		javafe.ast.BinaryExpr
+RSHIFT		javafe.ast.BinaryExpr
+URSHIFT		javafe.ast.BinaryExpr
+ADD		javafe.ast.BinaryExpr
+SUB		javafe.ast.BinaryExpr
+DIV		javafe.ast.BinaryExpr
+MOD		javafe.ast.BinaryExpr
+STAR		javafe.ast.BinaryExpr
+#
+# Assignment-operator tags:
+#
+ASSIGN		javafe.ast.BinaryExpr
+ASGMUL		javafe.ast.BinaryExpr
+ASGDIV		javafe.ast.BinaryExpr
+ASGREM		javafe.ast.BinaryExpr
+ASGADD		javafe.ast.BinaryExpr
+ASGSUB		javafe.ast.BinaryExpr
+ASGLSHIFT	javafe.ast.BinaryExpr
+ASGRSHIFT	javafe.ast.BinaryExpr
+ASGURSHIFT	javafe.ast.BinaryExpr
+ASGBITAND	javafe.ast.BinaryExpr
+ASGBITOR	javafe.ast.BinaryExpr
+ASGBITXOR	javafe.ast.BinaryExpr
+#
+#
+# Unary operator tags:
+#
+UNARYADD	javafe.ast.UnaryExpr
+UNARYSUB	javafe.ast.UnaryExpr
+NOT		javafe.ast.UnaryExpr
+BITNOT		javafe.ast.UnaryExpr
+INC		javafe.ast.UnaryExpr
+DEC		javafe.ast.UnaryExpr
+#
+# Postfix unary operators:
+#
+POSTFIXINC	javafe.ast.UnaryExpr
+POSTFIXDEC	javafe.ast.UnaryExpr
+#
+#
+# PrimitiveType tags:
+#
+BOOLEANTYPE	javafe.ast.PrimitiveType
+INTTYPE		javafe.ast.PrimitiveType
+LONGTYPE	javafe.ast.PrimitiveType
+CHARTYPE	javafe.ast.PrimitiveType
+FLOATTYPE	javafe.ast.PrimitiveType
+DOUBLETYPE	javafe.ast.PrimitiveType
+VOIDTYPE	javafe.ast.PrimitiveType
+NULLTYPE	javafe.ast.PrimitiveType
+BYTETYPE	javafe.ast.PrimitiveType
+SHORTTYPE	javafe.ast.PrimitiveType
+#
+# LiteralExpr tags:
+#
+BOOLEANLIT	javafe.ast.LiteralExpr
+INTLIT		javafe.ast.LiteralExpr
+LONGLIT		javafe.ast.LiteralExpr
+CHARLIT		javafe.ast.LiteralExpr
+FLOATLIT	javafe.ast.LiteralExpr
+DOUBLELIT	javafe.ast.LiteralExpr
+STRINGLIT	javafe.ast.LiteralExpr
+NULLLIT		javafe.ast.LiteralExpr

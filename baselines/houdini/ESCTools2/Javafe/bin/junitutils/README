@@ -1,0 +1,5 @@
+This is a package of utility classes that make it easy to create sets of
+test cases based on individual test files.  The code is modified from 
+similar classes in the MJ/JML project.
+
+- David Cok

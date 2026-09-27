@@ -15,10 +15,12 @@ from spec_harness.harness import (
 # JML extraction from LLM-generated Java source
 
 
-def _find_method_line(source: str) -> int | None:
+def _find_method_line(source: str, method_name: str | None = None) -> int | None:
     """
-    Use javalang to parse *source* and return the 1-based line number
-    of the first MethodDeclaration, relative to the original *source*.
+    Use javalang to parse *source* and return the 1-based line number of the
+    target MethodDeclaration, relative to the original *source*: `method_name`
+    if given, else `solve` if present, else the first method (helper methods
+    may precede the target).
     """
     lines = source.splitlines()
     # Count leading blank lines that .strip() would remove
@@ -42,13 +44,15 @@ def _find_method_line(source: str) -> int | None:
     except javalang.parser.JavaSyntaxError:
         return None
 
-    for _, node in tree:
-        if isinstance(node, jtree.MethodDeclaration) and node.position:
+    methods = [n for _, n in tree if isinstance(n, jtree.MethodDeclaration) and n.position]
+    wanted = method_name or ("solve" if any(m.name == "solve" for m in methods) else None)
+    for node in methods:
+        if wanted is None or node.name == wanted:
             return node.position.line + offset
     return None
 
 
-def extract_jml_spec(source: str) -> MethodSpec:
+def extract_jml_spec(source: str, method_name: str | None = None) -> MethodSpec:
     """
     Extract the raw JML comment block from above the method declaration.
 
@@ -58,7 +62,7 @@ def extract_jml_spec(source: str) -> MethodSpec:
     exact LLM-generated annotations.
     """
     lines = source.splitlines()
-    method_line = _find_method_line(source)
+    method_line = _find_method_line(source, method_name)
 
     if method_line is not None:
         # Walk backwards from the line before the method declaration.
@@ -107,7 +111,94 @@ def extract_jml_spec(source: str) -> MethodSpec:
         ]
         jml_block = "\n".join(jml_lines)
 
-    return MethodSpec(jml_block=jml_block)
+    helpers = ""
+    if method_line is not None:
+        try:
+            helpers = _other_members(lines, start + 1, method_line - 1)
+        except Exception:
+            helpers = ""
+    imports = "\n".join(l.strip() for l in lines
+                        if re.match(r"^\s*import\s+(static\s+)?[\w.]+(\.\*)?\s*;", l))
+    return MethodSpec(jml_block=jml_block, helpers=helpers, imports=imports)
+
+
+def _match_brace(text: str, open_idx: int) -> int:
+    """Index of the brace closing text[open_idx] == '{', skipping comments and
+    string/char literals; -1 if unbalanced."""
+    depth, i, n = 0, open_idx, len(text)
+    while i < n:
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        ch = text[i]
+        if ch in ('"', "'"):
+            j = i + 1
+            while j < n and text[j] != ch:
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _first_code_brace(text: str, start: int) -> int:
+    """First '{' at or after `start` that is not inside a comment or literal."""
+    i, n = start, len(text)
+    while i < n:
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if text[i] in ('"', "'"):
+            j = i + 1
+            while j < n and text[j] != text[i]:
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if text[i] == "{":
+            return i
+        i += 1
+    return -1
+
+
+def _other_members(lines: list[str], spec_start: int, method_idx: int) -> str:
+    """
+    Source text of every class member except the target method and its JML
+    block (lines[spec_start] .. end of the method body). Helper methods that the
+    spec calls are needed inside the stub classes, or the stub will not compile.
+    """
+    text = "\n".join(lines)
+    offs = [0]
+    for l in lines:
+        offs.append(offs[-1] + len(l) + 1)
+    m = re.search(r"\bclass\s+\w+[^{]*", text)
+    if not m:
+        return ""
+    body_open = _first_code_brace(text, m.end())
+    body_close = _match_brace(text, body_open) if body_open >= 0 else -1
+    meth_open = _first_code_brace(text, offs[method_idx])
+    meth_close = _match_brace(text, meth_open) if meth_open >= 0 else -1
+    if min(body_open, body_close, meth_open, meth_close) < 0:
+        return ""
+    before = text[body_open + 1: offs[spec_start]]
+    after = text[meth_close + 1: body_close]
+    members = (before + "\n" + after).strip("\n")
+    return members if members.strip() else ""
 
 
 # Test.java input-format detection
@@ -480,6 +571,12 @@ def detect_input_format(test_src: str, params: list[dict]) -> list[ReadOp]:
             ops.append(ReadOp(name, jtype, mode))
             continue
 
+        # --- char[] read as one line (Test.java: line.toCharArray()) ---
+        if jtype.is_array and jtype.array_dims == 1 and jtype.base in ("char", "Character") \
+                and re.search(r"toCharArray\s*\(", test_src or ""):
+            ops.append(ReadOp(name, jtype, "char_array"))
+            continue
+
         # --- 1-D array ---
         if jtype.is_array:
             mode = "array_sized" if has_sized_1d else "array_direct"
@@ -518,9 +615,27 @@ def _parse_scalar(type_name: str, s: str) -> Any:
     if type_name in ("boolean", "Boolean"):
         return s.lower() == "true"
     if type_name in ("char", "Character"):
-        return s
+        # Test.java reads a char as the first character of the first token (scanner.next() /
+        # split("\\s+")), and ' ' when there is no token
+        return s[0] if s else " "
     # String and everything else
     return s
+
+
+# Validated invalid inputs (testset T6): JSON-tagged values -> harness values
+
+def decode_tagged(value: Any) -> Any:
+    """Decode the JSON tags used for T6 invalid inputs: {"__map__": [[k, v], ...]} -> dict,
+    {"__float__": "nan" | "inf" | "-inf"} -> float; lists recursively; everything else as is."""
+    if isinstance(value, dict):
+        if "__map__" in value:
+            return {decode_tagged(k): decode_tagged(v) for k, v in value["__map__"]}
+        if "__float__" in value:
+            return float(value["__float__"])
+        return {k: decode_tagged(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [decode_tagged(v) for v in value]
+    return value
 
 
 # Input string → parameter dict
@@ -554,6 +669,11 @@ def parse_input(input_str: str, ops: list[ReadOp]) -> dict[str, Any]:
         # ---- single scalar -----------------------------------------------
         if op.mode == "scalar":
             result[op.name] = _parse_scalar(op.jtype.base, lines[pos].strip())
+            pos += 1
+
+        # ---- char[] from one line ----------------------------------------
+        elif op.mode == "char_array":
+            result[op.name] = list(lines[pos]) if pos < len(lines) else []
             pos += 1
 
         # ---- string -------------------------------------------------------
@@ -697,6 +817,10 @@ def parse_output(output_str: str, return_type: JType) -> Any:
                 row = [_parse_scalar(return_type.base, x) for x in line.split()]
                 rows.append(row)
         return rows
+
+    # ---- char[] (one line of characters) ----------------------------------
+    if return_type.is_array and return_type.array_dims == 1 and return_type.base in ("char", "Character"):
+        return list(output_str)
 
     # ---- 1-D array ---------------------------------------------------------
     if return_type.is_array:

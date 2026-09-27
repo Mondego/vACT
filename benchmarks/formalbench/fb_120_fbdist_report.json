@@ -1,0 +1,25 @@
+{
+ "population": {
+  "single_path_loop": 137,
+  "multi_path_loop": 237,
+  "nested": 103,
+  "sequential": 106,
+  "branch": 79
+ },
+ "allocation": {
+  "single_path_loop": 25,
+  "multi_path_loop": 43,
+  "nested": 19,
+  "sequential": 19,
+  "branch": 14
+ },
+ "n": 120,
+ "sample_distribution": {
+  "nested": 19,
+  "single_path_loop": 25,
+  "multi_path_loop": 43,
+  "branch": 14,
+  "sequential": 19
+ },
+ "overlap_with_old_fb_120": 24
+}

@@ -1,9 +1,12 @@
 """LLM model abstractions: base Model, ApiModel, and backends (OpenAI, Anthropic, Gemini, vLLM)."""
 
+import datetime
 import json
 import logging
 import os
 import re
+import threading
+import time
 import uuid
 import warnings
 from collections.abc import Generator
@@ -47,6 +50,8 @@ class ChatMessage:
     content: str | None = None
     tool_calls: list[ChatMessageToolCall] | None = None
     raw: Any | None = None
+    usage: dict | None = None          # normalized token usage of the call that produced it
+    latency_s: float | None = None     # wall time of that call
 
     def model_dump_json(self):
         return json.dumps(get_dict_from_nested_dataclasses(self, ignore_key="raw"))
@@ -163,6 +168,110 @@ def supports_stop_parameter(model_id: str) -> bool:
 
 
 
+# ---------------------------------------------------------------------------
+# Per-call LLM logging (thread-local: one model object is shared by parallel tasks)
+# ---------------------------------------------------------------------------
+
+_TLS = threading.local()
+
+
+def start_llm_call_log(path: str | None) -> None:
+    """Record every model call made by THIS thread (and append it to `path`)."""
+    _TLS.log_path = path
+    _TLS.calls = []
+    _TLS.last_usage = None
+
+
+def stop_llm_call_log() -> list[dict]:
+    """Stop recording for this thread; return the records collected."""
+    calls = list(getattr(_TLS, "calls", []) or [])
+    _TLS.log_path = None
+    _TLS.calls = []
+    return calls
+
+
+def peek_llm_calls() -> list[dict]:
+    """Records collected so far by this thread (recording continues)."""
+    return list(getattr(_TLS, "calls", []) or [])
+
+
+def thread_last_usage() -> dict | None:
+    """Usage of the most recent call made by this thread."""
+    return getattr(_TLS, "last_usage", None)
+
+
+def _as_dict(obj) -> dict | None:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj
+    for meth in ("model_dump", "to_dict", "to_json_dict"):
+        fn = getattr(obj, meth, None)
+        if callable(fn):
+            try:
+                d = fn()
+                if isinstance(d, dict):
+                    return d
+            except Exception:  # noqa: BLE001
+                pass
+    out = {}
+    for k in dir(obj):
+        if k.startswith("_"):
+            continue
+        try:
+            v = getattr(obj, k)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(v, (int, float, str, dict, type(None))):
+            out[k] = v
+    return out
+
+
+def usage_from_raw(raw) -> dict:
+    """
+    Normalize token usage from any backend response:
+      input_tokens (incl. cached), cached_input_tokens, cache_creation_input_tokens,
+      output_tokens, reasoning_tokens, total_tokens, plus the provider's raw usage.
+    """
+    if raw is None:
+        return {}
+    u = _as_dict(getattr(raw, "usage", None)) or _as_dict(getattr(raw, "usage_metadata", None)) or {}
+
+    def g(d, *path):
+        for p in path:
+            if not isinstance(d, dict):
+                return None
+            d = d.get(p)
+        return d
+
+    if "prompt_tokens" in u:                                   # OpenAI / vLLM
+        inp, out = u.get("prompt_tokens") or 0, u.get("completion_tokens") or 0
+        cached = g(u, "prompt_tokens_details", "cached_tokens") or 0
+        reasoning = g(u, "completion_tokens_details", "reasoning_tokens") or 0
+        creation, total = 0, u.get("total_tokens") or inp + out
+    elif "input_tokens" in u:                                  # Anthropic
+        cached = u.get("cache_read_input_tokens") or 0
+        creation = u.get("cache_creation_input_tokens") or 0
+        inp = (u.get("input_tokens") or 0) + cached + creation
+        out, reasoning = u.get("output_tokens") or 0, 0
+        total = inp + out
+    elif "prompt_token_count" in u:                            # Gemini
+        inp, out = u.get("prompt_token_count") or 0, u.get("candidates_token_count") or 0
+        cached, creation = u.get("cached_content_token_count") or 0, 0
+        reasoning = u.get("thoughts_token_count") or 0
+        total = u.get("total_token_count") or inp + out + reasoning
+    else:
+        return {"raw": u}
+    return {"input_tokens": inp, "cached_input_tokens": cached, "cache_creation_input_tokens": creation,
+            "output_tokens": out, "reasoning_tokens": reasoning, "total_tokens": total, "raw": u}
+
+
+def _jsonable(o):
+    if isinstance(o, Enum):
+        return o.value
+    return str(o)
+
+
 # Base Model
 class Model:
     def __init__(self, flatten_messages_as_text=False, tool_name_key="name", tool_arguments_key="arguments", model_id=None, **kwargs):
@@ -195,7 +304,48 @@ class Model:
         raise NotImplementedError
 
     def __call__(self, *args, **kwargs):
-        return self.generate(*args, **kwargs)
+        """Generate, and record the call (request, response, usage, latency) per thread."""
+        messages = args[0] if args else kwargs.get("messages")
+        ts_start = datetime.datetime.now().isoformat(timespec="milliseconds")
+        t0 = time.time()
+        msg, err = None, None
+        try:
+            msg = self.generate(*args, **kwargs)
+            return msg
+        except Exception as exc:  # noqa: BLE001  (recorded, then re-raised)
+            err = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            latency = round(time.time() - t0, 3)
+            raw = getattr(msg, "raw", None) if msg is not None else None
+            usage = usage_from_raw(raw)
+            if msg is not None:
+                msg.usage, msg.latency_s = usage, latency
+            _TLS.last_usage = usage
+            if getattr(_TLS, "calls", None) is not None or getattr(_TLS, "log_path", None):
+                record = {
+                    "call_index": len(getattr(_TLS, "calls", []) or []),
+                    "ts_start": ts_start,
+                    "latency_s": latency,
+                    "model_id": self.model_id,
+                    "stop_sequences": kwargs.get("stop_sequences"),
+                    "request_messages": messages,
+                    "response_content": getattr(msg, "content", None) if msg is not None else None,
+                    "response_id": getattr(raw, "id", None),
+                    "response_model": getattr(raw, "model", None),
+                    "usage": usage,
+                    "error": err,
+                }
+                if not hasattr(_TLS, "calls") or _TLS.calls is None:
+                    _TLS.calls = []
+                _TLS.calls.append({k: v for k, v in record.items() if k != "request_messages"})
+                path = getattr(_TLS, "log_path", None)
+                if path:
+                    try:
+                        with open(path, "a") as fh:
+                            fh.write(json.dumps(record, default=_jsonable) + "\n")
+                    except Exception:  # noqa: BLE001  (logging must not break the agent)
+                        pass
 
     def parse_tool_calls(self, message: ChatMessage) -> ChatMessage:
         message.role = MessageRole.ASSISTANT

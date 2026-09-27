@@ -8,15 +8,21 @@ the original VeriAct.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import shutil
+import socket
+import sys
+import time
 from datetime import datetime
 
 from veriact.agent.cli_agent import CLIAgent
 from veriact.core.data_types import HARNESS_PASS_THRESHOLD, Task
 from veriact.core.file_utility import dump_json
 from veriact.core.memory import ActionStep
+from veriact.core.models import peek_llm_calls, start_llm_call_log, stop_llm_call_log
 from veriact.tools.descriptors import RunHarnessTool, VerifyTool
 from veriact.core.utility import AgentMaxStepsError
 
@@ -38,6 +44,7 @@ def _task_to_record(task: Task) -> dict:
         "generated_test_cases": [
             {"input": tc.input, "output": tc.output} for tc in task.generated_test_cases
         ],
+        "invalid_inputs": task.invalid_inputs,
     }
 
 
@@ -93,6 +100,86 @@ class VeriActAgent:
 
     def run(self, task: Task) -> dict:
         workspace, task_json = self._setup_workspace(task)
+        harness_dir = os.path.join(workspace, "harness")
+        # Keep earlier sessions' logs of this workspace (never overwrite).
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S_%f")
+        for name in ("llm_calls.jsonl", "tool_calls.jsonl", "run_meta.json"):
+            p = os.path.join(harness_dir, name)
+            if os.path.exists(p):
+                dest = os.path.join(harness_dir, "previous_runs", stamp)
+                os.makedirs(dest, exist_ok=True)
+                shutil.move(p, os.path.join(dest, name))
+        start_llm_call_log(os.path.join(harness_dir, "llm_calls.jsonl"))
+        ts_start, t0 = datetime.now().isoformat(timespec="milliseconds"), time.time()
+        error = None
+        try:
+            return self._run_task(task, workspace, task_json)
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            calls = stop_llm_call_log()
+            self._write_run_meta(task, workspace, calls, ts_start, time.time() - t0, error)
+
+    def _usage_totals(self, calls: list[dict]) -> dict:
+        keys = ["input_tokens", "cached_input_tokens", "cache_creation_input_tokens",
+                "output_tokens", "reasoning_tokens", "total_tokens"]
+        tot = {k: sum((c.get("usage") or {}).get(k, 0) or 0 for c in calls) for k in keys}
+        tot["llm_calls"] = len(calls)
+        tot["llm_latency_s"] = round(sum(c.get("latency_s") or 0 for c in calls), 3)
+        return tot
+
+    @staticmethod
+    def _tool_call_counts(harness_dir: str) -> dict:
+        counts: dict[str, int] = {}
+        try:
+            for line in open(os.path.join(harness_dir, "tool_calls.jsonl")):
+                cmd = json.loads(line).get("command", "?")
+                counts[cmd] = counts.get(cmd, 0) + 1
+        except (OSError, json.JSONDecodeError):
+            pass
+        return counts
+
+    def _write_run_meta(self, task, workspace, calls, ts_start, wall_s, error) -> None:
+        harness_dir = os.path.join(workspace, "harness")
+
+        def sha(path):
+            try:
+                with open(path, "rb") as fh:
+                    return hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                return None
+
+        pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        meta = {
+            "task_id": task.task_id,
+            "agent": "veriact",
+            "model": getattr(self.model, "model_id", None),
+            "mode": "no-harness" if self.no_harness else "with-harness",
+            "max_steps": self.max_steps,
+            "planning_interval": self.planning_interval,
+            "harness_threshold": self.harness_threshold,
+            "host": socket.gethostname(),
+            "python": sys.version.split()[0],
+            "ts_start": ts_start,
+            "ts_end": datetime.now().isoformat(timespec="milliseconds"),
+            "wall_s": round(wall_s, 3),
+            "error": error,
+            "usage": self._usage_totals(calls),
+            "tool_calls": self._tool_call_counts(harness_dir),
+            "integrity_blocks": getattr(self, "_last_integrity_blocks", None),
+            "step_durations_s": getattr(self, "_last_step_durations", None),
+            "tool_sha256": {n: sha(os.path.join(pkg, "tools", n))
+                            for n in ("cli.py", "harness_tool.py", "verifier_tool.py")},
+            "prompt_sha256": sha(os.path.join(pkg, "prompts", "veriact_cli_no_harness_prompt.yaml"
+                                              if self.no_harness else "veriact_cli_prompt.yaml")),
+            "submission_exists": os.path.exists(os.path.join(workspace, "submission.json")),
+        }
+        with open(os.path.join(harness_dir, "run_meta.json"), "w") as fh:
+            json.dump(meta, fh, indent=2, default=str)
+        self._last_meta = meta
+
+    def _run_task(self, task, workspace, task_json) -> dict:
 
         # Ablation: no-harness arm exposes only verify (+ task_complete) and uses
         # the harness-free prompt; success = verification passes.
@@ -134,6 +221,8 @@ class VeriActAgent:
             1 for s in action_steps if not isinstance(s.error, AgentMaxStepsError)
         )
 
+        self._last_integrity_blocks = getattr(agent, "integrity_blocks", None)
+        self._last_step_durations = list(getattr(getattr(agent, "monitor", None), "step_durations", []) or [])
         trajectory = {
             "task_id": task.task_id,
             "success": success,
@@ -141,6 +230,12 @@ class VeriActAgent:
             "agent_output": result,
             "agent_dict": agent.to_dict(),
             "_last_attempted_code": last_code,
+            # Filled in from the per-call log (see _write_run_meta for run_meta.json).
+            "usage": self._usage_totals(peek_llm_calls()),
+            "integrity_blocks": self._last_integrity_blocks,
+            "step_durations_s": self._last_step_durations,
+            "llm_calls_log": os.path.join(workspace, "harness", "llm_calls.jsonl"),
+            "tool_calls_log": os.path.join(workspace, "harness", "tool_calls.jsonl"),
         }
 
         trajectories_dir = os.path.join(self.output_dir, "trajectories")
@@ -167,8 +262,8 @@ class VeriActAgent:
                     for _tid, metrics in scores.items():
                         if not isinstance(metrics, dict):
                             continue
-                        pc = metrics.get("post_correctness", 0.0)
-                        pcm = metrics.get("post_completeness", 0.0)
+                        pc = metrics.get("post_correctness") or 0.0        # None = not evaluable
+                        pcm = metrics.get("post_completeness") or 0.0
                         return pc >= threshold and pcm >= threshold
         return False
 

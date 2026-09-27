@@ -146,7 +146,7 @@ def write_to_file(content: str, filepath: str) -> None:
 def verify_with_openjml(
     code_with_spec: str,
     classname: str,
-    timeout: int = 180,
+    timeout: int = 300,
     output_dir: str = "veriact_outputs/tmp",
 ) -> VerificationResult:
 

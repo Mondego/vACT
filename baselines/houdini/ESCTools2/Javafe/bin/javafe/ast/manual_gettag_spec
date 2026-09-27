@@ -1,0 +1,8 @@
+  //@ ensures (this instanceof LiteralExpr) ==> \result==((LiteralExpr)this).tag;
+  //@ ensures (this instanceof BinaryExpr) ==> \result==((BinaryExpr)this).op;
+  //@ ensures (this instanceof UnaryExpr) ==> \result==((UnaryExpr)this).op;
+  //@ ensures (this instanceof PrimitiveType) ==>\result==((PrimitiveType)this).tag;
+  //
+  //@ ensures (\result==javafe.tc.TagConstants.TYPESIG) ==> \typeof(this) <: \type(javafe.tc.TypeSig);
+  //
+  // Remaining part of spec is automatically generated:

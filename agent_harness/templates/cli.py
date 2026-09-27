@@ -111,6 +111,8 @@ def _load_task() -> Task:
 
 
 def _emit(obj) -> None:
+    global _LAST_EMIT
+    _LAST_EMIT = obj
     print(json.dumps(obj, indent=2))
 
 
@@ -297,6 +299,8 @@ def cmd_harness(args: argparse.Namespace) -> int:
             "pre_completeness": scores.get("pre_completeness", 0.0),
         }
     }
+    if scores.get("note"):
+        out[task.task_id]["note"] = scores["note"]
     with open(LAST_SCORES, "w") as fh:
         json.dump(out, fh, indent=2)
     if not args.no_budget:
@@ -330,8 +334,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         if isinstance(metrics, dict):
             scores = metrics
             passed = (
-                metrics.get("post_correctness", 0.0) >= HARNESS_PASS_THRESHOLD
-                and metrics.get("post_completeness", 0.0) >= HARNESS_PASS_THRESHOLD
+                (metrics.get("post_correctness") or 0.0) >= HARNESS_PASS_THRESHOLD      # None = not evaluable
+                and (metrics.get("post_completeness") or 0.0) >= HARNESS_PASS_THRESHOLD
             )
 
     submission = {
@@ -359,6 +363,36 @@ def cmd_submit(args: argparse.Namespace) -> int:
     return 0
 
 
+
+# ---------------------------------------------------------------------------
+# tool-call log: one JSON line per invocation, independent of the agent
+# ---------------------------------------------------------------------------
+
+_LAST_EMIT = None
+
+
+def _log_tool_call(log_path, record):
+    """Append one record to the tool-call log; logging must never break the tool."""
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _code_snapshot(path):
+    import hashlib
+    try:
+        with open(path) as fh:
+            code = fh.read()
+        return {"code_path": path, "code_sha256": hashlib.sha256(code.encode()).hexdigest(), "code": code}
+    except Exception:
+        return {"code_path": path}
+
+
+TOOL_CALLS = os.path.join(HARNESS_DIR, "tool_calls.jsonl")
+
 # ---------------------------------------------------------------------------
 # argument parsing
 # ---------------------------------------------------------------------------
@@ -384,7 +418,7 @@ def build_parser() -> argparse.ArgumentParser:
     ph = sub.add_parser("harness", help="score the spec on the 4 spec-harness metrics")
     ph.add_argument("--code", help="path to Java source (default: ../Solution.java)")
     ph.add_argument("--openjml", help="OpenJML binary path (default: $OPENJML or 'openjml')")
-    ph.add_argument("--max-pairs", type=int, default=5, dest="max_pairs",
+    ph.add_argument("--max-pairs", type=int, default=10, dest="max_pairs",
                     help="max test pairs to score (default: 5)")
     ph.add_argument("--no-budget", action="store_true",
                     help="don't count this run against the attempt budget "
@@ -399,8 +433,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import datetime
+    import time
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    start = time.time()
+    rec = {
+        "ts_start": datetime.datetime.now().isoformat(timespec="milliseconds"),
+        "command": args.command,
+        "offline": bool(getattr(args, "no_budget", False)),
+        **_code_snapshot(getattr(args, "code", None) or os.path.join(TASK_DIR, "Solution.java")),
+    }
+    rc, err = None, None
+    try:
+        rc = args.func(args)
+        return rc
+    except BaseException as exc:  # noqa: BLE001  (logged, then re-raised)
+        err = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        rec.update({
+            "ts_end": datetime.datetime.now().isoformat(timespec="milliseconds"),
+            "duration_s": round(time.time() - start, 3),
+            "exit_code": rc,
+            "error": err,
+            "output": _LAST_EMIT,
+            **_budget_info(),
+        })
+        _log_tool_call(TOOL_CALLS, rec)
 
 
 if __name__ == "__main__":

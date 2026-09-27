@@ -91,8 +91,8 @@ def score_workspace(ws: str, openjml: str, max_pairs: int, threshold: float) -> 
     for m in METRICS:
         row[m] = scores.get(m, 0.0)
     row["passed"] = (
-        scores.get("post_correctness", 0.0) >= threshold
-        and scores.get("post_completeness", 0.0) >= threshold
+        (scores.get("post_correctness") or 0.0) >= threshold          # None = not evaluable
+        and (scores.get("post_completeness") or 0.0) >= threshold
     )
     return row
 

@@ -12,6 +12,7 @@ system_prompt: |-
   - "tool" must be one of: verify, task_complete.
   - Provide the COMPLETE annotated Java source in tool_input each time you call verify.
   - The class MUST be named Solution.
+  - Do NOT change the program: keep the class name, the method signature, and every statement of the method body exactly as given; only add JML annotations. A call with modified code is rejected without running the tool.
 
   ## Tools
 

@@ -52,6 +52,33 @@ from veriact.core.utility import (
 
 logger = getLogger(__name__)
 
+try:  # same integrity check as the Spec-Harness evaluation (generated vendored copy)
+    from veriact.tools.harness_tool import JavaMethodParser, check_integrity
+except Exception:  # pragma: no cover
+    JavaMethodParser = check_integrity = None
+
+
+def integrity_violation(original_code: str, code: str) -> Optional[str]:
+    """
+    Reason string if `code` changes the class name, the method signature, or the
+    method body of `original_code` (JML annotations and braces added around single
+    statements are allowed); None if unchanged or if either side cannot be parsed
+    (then the call is let through and OpenJML reports real syntax errors).
+    """
+    if not original_code or check_integrity is None:
+        return None
+    try:
+        parser = JavaMethodParser()
+        orig = parser.parse(original_code)
+        new = parser.parse(code, orig["method_name"])
+        r = check_integrity(original_code, code, orig, new)
+    except Exception:
+        return None
+    if r["class_renamed"] or r["signature_changed"] or r["body_modified"]:
+        return r["reason"] or "code differs from the original program"
+    return None
+
+
 # Path to the tool CLI invoked as a subprocess (veriact/tools/cli.py).
 _PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # veriact/
 CLI_PATH = os.path.join(_PKG_DIR, "tools", "cli.py")
@@ -381,6 +408,14 @@ class CLIAgent(MultiStepAgent):
         self.tool_timeout = tool_timeout
         self._last_code: Optional[str] = None
         self._solution_path = os.path.join(workspace_dir, "Solution.java")
+        # Original program, used to reject tool calls that rewrite the code.
+        self._original_code = ""
+        try:
+            with open(task_json) as fh:
+                self._original_code = json.load(fh).get("code", "")
+        except Exception:
+            self._original_code = ""
+        self.integrity_blocks = 0
 
         super().__init__(
             tools=tools,
@@ -446,6 +481,23 @@ class CLIAgent(MultiStepAgent):
         if not code:
             obs = json.dumps({"error": "tool_input.jml_annotated_code is required"})
             return obs, False, {"tool_name": tool_name, "args": tool_input, "output": obs}
+        # Reject code that changes the program (class, signature, or method body)
+        # before anything is written or run; Solution.java keeps the last valid code,
+        # so task_complete can never submit a rewritten program.
+        violation = integrity_violation(self._original_code, code)
+        if violation:
+            self.integrity_blocks += 1
+            obs = json.dumps({
+                "error": "code_modified",
+                "detail": violation,
+                "instruction": ("Do not change the program. Keep the class name, the method "
+                                "signature, and every statement of the method body exactly as in "
+                                "the original; only add JML annotations (requires/ensures/"
+                                "loop_invariant/assignable/decreases). The tool was not run."),
+            })
+            return obs, False, {"tool_name": tool_name, "args": {"task_id": self.task_id},
+                                "output": obs, "integrity_blocked": True}
+
         # persist the latest code so verify/harness read the same file
         with open(self._solution_path, "w") as fh:
             fh.write(code)

@@ -51,9 +51,9 @@ HARNESS_FILES = [
 WRAPPER_FILES_BASE = ["verify.sh", "submit.sh"]
 HARNESS_WRAPPER = "run_specharness.sh"
 # Parent-root helpers dropped once into the out-root.
-ROOT_FILES = ["run_agents.py", "collect.py", "score_all.py", "aggregate.py"]
+ROOT_FILES = ["run_agents.py", "collect.py", "score_all.py", "aggregate.py", "usage_report.py"]
 
-MAX_PAIRS = 5
+MAX_PAIRS = 10                      # T5 feedback list size
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ def scaffold_task(
     _write(os.path.join(task_dir, "Solution.java"), task.get("code", ""))
     _write(os.path.join(task_dir, "Test.java"), task.get("test_code", ""))
 
-    # Exactly-5 IO pairs.
+    # The feedback pairs (MAX_PAIRS; with a *_v2_feedback.json benchmark these are the T5 feedback list).
     pairs = pick_pairs(task)
     for i, pair in enumerate(pairs):
         _write(
@@ -157,7 +157,7 @@ def scaffold_task(
             json.dumps({"input": pair["input"], "output": pair["output"]}, indent=2),
         )
 
-    # Authoritative task record for the harness CLI: the chosen 5 pairs as
+    # Authoritative task record for the harness CLI: the chosen pairs as
     # test_inputs, generated_test_cases emptied (so scoring == tests/).
     task_record = dict(task)
     task_record["test_inputs"] = pairs

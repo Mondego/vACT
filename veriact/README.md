@@ -110,5 +110,23 @@ veriact/
     agent_types.py  file_utility.py  utility.py
 ```
 
-The OpenJML flags, mutant budget (k=5), and `max_pairs=5` in `tools/harness_tool.py`
-and `tools/verifier_tool.py` match the original VeriAct scorer/verifier.
+The OpenJML flags and mutant budget (k=5) in `tools/harness_tool.py` and `tools/verifier_tool.py`
+match the original VeriAct scorer/verifier. The harness tool scores on `max_pairs=10` pairs: with a
+`*_v2_feedback.json` benchmark these are the T5 feedback list, disjoint from the evaluation pairs used
+for final scoring. When the task carries `invalid_inputs` (validated T-, testset T6), PreComp uses exactly
+those; otherwise the old heuristic generator.
+
+## What gets recorded (per task, under `<run-dir>/workspaces/<task>/harness/`)
+
+| File | Content |
+|---|---|
+| `llm_calls.jsonl` | One line per model call (planning and action): request messages, response text, latency, response id, and normalized token usage (input incl. cached, cached, cache creation, output, reasoning, plus the provider's raw usage). Recording is per thread, so parallel tasks sharing one model object never mix. |
+| `tool_calls.jsonl` | One line per `verify` / `harness` / `submit` CLI call (code snapshot and hash, output, duration). |
+| `run_meta.json` | Model, mode, max steps, host, start/end, wall time, usage totals, tool-call counts, integrity blocks, step durations, hashes of the tools and the prompt, error if the run crashed. |
+| `previous_runs/<timestamp>/` | Logs of earlier runs of the same workspace. |
+
+The trajectory JSON also carries `usage`, `integrity_blocks` and `step_durations_s`.
+
+**Integrity check:** a `verify` / `run_spec_harness` call whose code changes the class name, method signature or method body is rejected before the tool runs, with a `code_modified` error. `Solution.java` keeps the last valid code.
+
+Summarize with `python agent_harness/templates/usage_report.py --root <run-dir>`.
