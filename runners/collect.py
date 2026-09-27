@@ -8,21 +8,29 @@ Collect RQ3 / RQ4 results from one or more machines into CSVs (figures are gener
 rq3 writes
   rq3_per_spec.csv       one row per RQ1 spec (all machines merged)
   rq3_fig4_cells.csv     Fig. 4: per benchmark x model x approach (SG/AS/FB) x metric x tau:
-                         n_verified, n_evaluable, n_meeting, fraction = n_meeting / n_evaluable
-  rq3_by_config.csv      per RQ1 file (approach, bench, model, prompt) x metric: mean and fraction >= tau
-                         (Fig. 5 / Table IV select from it)
+                         fraction = n_meeting / denominator, with a FIXED denominator (see below), plus the
+                         counts behind it (verified, evaluable, not evaluable, unknown)
+  rq3_by_config.csv      per RQ1 file (approach, bench, model, prompt) x metric: fraction >= tau over the fixed
+                         denominator, and the mean over evaluable specs (Fig. 5 / Table IV select from it)
   rq3_collect_report.json  completeness (expected vs present units), statuses, bundle hashes, conflicts
 rq4 writes
   rq4_per_task.csv       one row per (arm, agent, bench, task)
-  rq4_summary.csv        per arm x agent x bench: VR, Post-Harness@tau (PostCorr >= tau and PostComp >= tau;
-                         denominator = all tasks, unverified = 0, tasks with all-unknown post checks excluded
-                         and counted), mean metrics, fraction >= tau per metric
+  rq4_summary.csv        per arm x agent x bench: VR, Post-Harness@tau (PostCorr >= tau and PostComp >= tau) and
+                         fraction >= tau per metric, all over the FIXED denominator; all-unknown post checks
+                         are counted (not meeting); mean metrics over evaluable tasks
   rq4_collect_report.json
 
 Scoring conventions (identical to the paper's definitions):
-  * integrity failure -> every metric = 0 and evaluable (a failed synthesis, not an unscorable one)
-  * a metric with no decided check (e.g. PreComp with an empty T-, all-unknown post checks) is not
-    evaluable: it is left out of that metric's denominator and counted in n_not_evaluable
+  * integrity failure / no postcondition (D13) -> every metric = 0 (a failed synthesis, not an unscorable one)
+  * FIXED denominators (D14, like the verification rate of Fig. 3): whatever a run produced, a fraction >= tau
+    is n_meeting / (benchmark tasks x prompt configurations of the cell). SpecGenBench = 120 tasks,
+    FormalBench = 662 (RQ3) and FB-120 = 120 (RQ4), from the evaluation suite files. Prompt configurations
+    are the RQ1 design: SpecGen 3, AutoSpec 3, FormalBench 5, Houdini / Daikon 1 (the RQ1 files per
+    bench x approach x model); RQ4 has 1. Everything that does not reach tau counts as not meeting: not
+    verified in RQ1 / by the agent, no postcondition, integrity failure, undecided (unknown) checks.
+    PreComp: the denominator is the tasks whose evaluation suite has invalid inputs (T-), x configurations;
+    for the other tasks no input makes the reference fail, so PreComp is undefined by design (a fixed set
+    per benchmark: SGB 65, FB 523, FB-120 96). The means are over evaluable specs and are descriptive only.
 """
 from __future__ import annotations
 
@@ -41,6 +49,22 @@ SHORT = {"post_correctness": "PostCorr", "post_completeness": "PostComp", "pre_c
          "pre_completeness": "PreComp"}
 APPROACH = {"specgen": "SG", "autospec": "AS", "formalbench": "FB"}
 THRESHOLDS = (0.25, 0.5, 0.75, 1.0)
+SUITE_FILES = {"rq3": {"sgb": "specgenbench/sgb_v2_eval.json", "fb": "formalbench/fb_v2_eval.json"},
+               "rq4": {"sgb": "specgenbench/sgb_v2_eval.json", "fb": "formalbench/fb_120_v2_eval.json"}}
+
+
+def fixed_sizes(rq: str) -> dict:
+    """bench -> (tasks, tasks with a non-empty evaluation T-), from the suite files the scoring used."""
+    out = {}
+    for b, rel in SUITE_FILES[rq].items():
+        ts = json.load(open(os.path.join(C.REPO, "benchmarks", rel)))
+        out[b] = (len(ts), sum(1 for t in ts if t.get("invalid_inputs")))
+    return out
+
+
+def meets(r: dict, m: str, t: float) -> bool:
+    x = r.get(SHORT[m], "")
+    return x != "" and float(x) >= t
 
 
 def metric_values(rec: dict) -> dict:
@@ -110,37 +134,64 @@ def cmd_rq3(a) -> int:
         rows.append(row)
     write_csv(os.path.join(a.out, "rq3_per_spec.csv"), rows)
 
+    # fixed denominators (D14): tasks (or tasks with T-) x RQ1 prompt configurations of the cell
+    sizes = fixed_sizes("rq3")
+    configs = collections.defaultdict(set)                 # (bench, approach, model) -> RQ1 files
+    for f in glob.glob(os.path.join(a.rq1_dir, "*.jsonl")):
+        meta = rq3_run.parse_stem(os.path.basename(f)[:-6])
+        configs[(meta["bench"], meta["approach"], meta["model"])].add(os.path.basename(f)[:-6])
+
+    def denom(bench, m, n_configs):
+        return (sizes[bench][1] if m == "pre_completeness" else sizes[bench][0]) * n_configs
+
     # Fig. 4 cells: per bench x model x approach(SG/AS/FB) x metric x tau
     cells = []
     groups = collections.defaultdict(list)
     for r in rows:
-        if r["approach"] in APPROACH and r["status"] == "scored":
-            groups[(r["bench"], r["model"], APPROACH[r["approach"]])].append(r)
-    for (bench, model, ap), rs in sorted(groups.items()):
+        if r["approach"] in APPROACH:
+            groups[(r["bench"], r["model"], r["approach"])].append(r)
+    for (bench, approach, model) in sorted(configs):
+        if approach not in APPROACH:
+            continue
+        rs = [r for r in groups.get((bench, model, approach), []) if r["status"] == "scored"]
+        n_cfg = len(configs[(bench, approach, model)])
         for m in METRICS:
-            vals = [float(r[SHORT[m]]) for r in rs if r[SHORT[m]] != ""]
+            vals = [r for r in rs if r[SHORT[m]] != ""]
             for t in THRESHOLDS:
-                meet = sum(1 for x in vals if x >= t)
-                cells.append({"bench": bench, "model": model, "approach": ap, "metric": SHORT[m], "tau": t,
-                              "n_verified": len(rs), "n_evaluable": len(vals), "n_not_evaluable": len(rs) - len(vals),
-                              "n_meeting": meet, "fraction": round(meet / len(vals), 4) if vals else ""})
+                meet = sum(1 for r in rs if meets(r, m, t))
+                d = denom(bench, m, n_cfg)
+                cells.append({"bench": bench, "model": model, "approach": APPROACH[approach], "metric": SHORT[m],
+                              "tau": t, "configs": n_cfg, "denominator": d, "n_meeting": meet,
+                              "fraction": round(meet / d, 4),
+                              "n_verified_scored": len(rs), "n_evaluable": len(vals),
+                              "n_not_evaluable": len(rs) - len(vals),
+                              "n_no_postcondition": sum(1 for r in rs if r["no_postcondition"] is True),
+                              "n_integrity_failed": sum(1 for r in rs if r["integrity_failed"] is True),
+                              "n_post_all_unknown": sum(1 for r in rs if r["post_all_unknown"] is True)})
     write_csv(os.path.join(a.out, "rq3_fig4_cells.csv"), cells)
 
     # per RQ1 configuration (all approaches incl. Houdini / Daikon): Fig. 5 / Table IV select from this
     by = collections.defaultdict(list)
     for r in rows:
         if r["status"] == "scored":
-            by[(r["approach"], r["bench"], r["model"], r["prompt"], r["file"])].append(r)
+            by[r["file"]].append(r)
     conf = []
-    for (ap, bench, model, prompt, f), rs in sorted(by.items()):
-        row = {"approach": ap, "bench": bench, "model": model, "prompt": prompt, "file": f, "n_scored": len(rs)}
-        for m in METRICS:
-            vals = [float(r[SHORT[m]]) for r in rs if r[SHORT[m]] != ""]
-            row[f"{SHORT[m]}_n_evaluable"] = len(vals)
-            row[f"{SHORT[m]}_mean"] = round(sum(vals) / len(vals), 4) if vals else ""
+    for (bench, ap, model), files in sorted(configs.items()):
+        for f in sorted(files):
+            rs = by.get(f, [])
+            meta = rq3_run.parse_stem(f)
+            row = {"approach": ap, "bench": bench, "model": model, "prompt": meta["prompt"], "file": f,
+                   "n_scored": len(rs), "tasks": sizes[bench][0], "tasks_with_tminus": sizes[bench][1]}
+            for m in METRICS:
+                vals = [float(r[SHORT[m]]) for r in rs if r[SHORT[m]] != ""]
+                row[f"{SHORT[m]}_n_evaluable"] = len(vals)
+                row[f"{SHORT[m]}_mean_evaluable"] = round(sum(vals) / len(vals), 4) if vals else ""
+                for t in THRESHOLDS:
+                    row[f"{SHORT[m]}_ge{t:g}"] = round(sum(1 for r in rs if meets(r, m, t)) / denom(bench, m, 1), 4)
             for t in THRESHOLDS:
-                row[f"{SHORT[m]}_ge{t:g}"] = round(sum(1 for x in vals if x >= t) / len(vals), 4) if vals else ""
-        conf.append(row)
+                row[f"PostHarness@{t:g}"] = round(sum(1 for r in rs if meets(r, "post_correctness", t)
+                                                      and meets(r, "post_completeness", t)) / sizes[bench][0], 4)
+            conf.append(row)
     write_csv(os.path.join(a.out, "rq3_by_config.csv"), conf)
 
     report = {"expected_units": len(expected), "present": len(recs),
@@ -177,25 +228,29 @@ def cmd_rq4(a) -> int:
         row.update(host=(r.get("provenance") or {}).get("host", ""), bundle=(r.get("provenance") or {}).get("bundle", ""))
         rows.append(row)
     write_csv(os.path.join(a.out, "rq4_per_task.csv"), rows)
+    sizes = fixed_sizes("rq4")
     summ = []
     groups = collections.defaultdict(list)
     for r in rows:
         groups[(r["arm"], r["agent"], r["bench"])].append(r)
     for (arm, agent, bench), rs in sorted(groups.items()):
-        s = {"arm": arm, "agent": agent, "bench": bench, "n_tasks": len(rs),
-             "verified": sum(1 for r in rs if r["verified"] is True), }
-        s["VR"] = round(s["verified"] / len(rs), 4)
-        unk = [r for r in rs if r["post_all_unknown"] is True]
-        denom = [r for r in rs if r not in unk]
-        s["post_all_unknown"] = len(unk)
+        n, n_pre = sizes[bench]
+        ok_rs = [r for r in rs if r["verified"] is True]          # unverified: no metric meets any tau
+        s = {"arm": arm, "agent": agent, "bench": bench, "tasks": n, "tasks_with_tminus": n_pre,
+             "task_records": len(rs), "verified": len(ok_rs)}
+        s["VR"] = round(len(ok_rs) / n, 4)
+        s["post_all_unknown"] = sum(1 for r in rs if r["post_all_unknown"] is True)
+        s["no_postcondition"] = sum(1 for r in rs if r["no_postcondition"] is True)
+        s["integrity_failed"] = sum(1 for r in rs if r["integrity_failed"] is True)
         for t in THRESHOLDS:
-            ok = sum(1 for r in denom if r["PostCorr"] != "" and r["PostComp"] != ""
-                     and float(r["PostCorr"]) >= t and float(r["PostComp"]) >= t)
-            s[f"PostHarness@{t:g}"] = round(ok / len(denom), 4) if denom else ""
+            s[f"PostHarness@{t:g}"] = round(sum(1 for r in ok_rs if meets(r, "post_correctness", t)
+                                                and meets(r, "post_completeness", t)) / n, 4)
         for m in METRICS:
-            vals = [float(r[SHORT[m]]) for r in rs if r[SHORT[m]] != ""]
-            s[f"{SHORT[m]}_mean"] = round(sum(vals) / len(vals), 4) if vals else ""
-            s[f"{SHORT[m]}_ge0.75"] = round(sum(1 for x in vals if x >= 0.75) / len(vals), 4) if vals else ""
+            vals = [float(r[SHORT[m]]) for r in ok_rs if r[SHORT[m]] != ""]
+            s[f"{SHORT[m]}_mean_evaluable"] = round(sum(vals) / len(vals), 4) if vals else ""
+            for t in THRESHOLDS:
+                s[f"{SHORT[m]}_ge{t:g}"] = round(sum(1 for r in ok_rs if meets(r, m, t))
+                                                 / (n_pre if m == "pre_completeness" else n), 4)
         summ.append(s)
     write_csv(os.path.join(a.out, "rq4_summary.csv"), summ)
     report = {"present": len(recs), "status": dict(collections.Counter(r.get("status") for r in recs.values())),

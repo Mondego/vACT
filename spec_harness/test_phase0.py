@@ -513,6 +513,21 @@ def test_spec_without_ensures_scores_zero_everywhere():
             assert res[m]["evaluable"] is True and res[m]["score"] == 0.0, (m, res[m])
 
 
+def test_missing_or_unparseable_method_is_integrity_failure():
+    """F10: `solve` renamed, or a bare JML clause outside a comment (not Java): scored 0, not excluded."""
+    import json, tempfile
+    from spec_harness.eval_llm_response import Task, evaluate_problem
+    t = next(x for x in json.load(open("benchmarks/specgenbench/sgb_v2_eval.json")) if x["task_id"] == "SGB_Abs")
+    renamed = t["code"].replace("solve(", "absValue(", 1)
+    bare = t["code"].replace("{", "{\n    requires true;", 1)
+    for code in (renamed, bare):
+        res = evaluate_problem(Task.from_dict(t), code, openjml_path="/nonexistent/openjml",
+                               output_dir=tempfile.mkdtemp(), max_pairs=0, exclude_collection_tasks=False)
+        assert res["integrity_failed"] is True and res["excluded"] is False, res
+        assert all(res[m]["score"] == 0.0 for m in ("post_correctness", "post_completeness",
+                                                    "pre_correctness", "pre_completeness"))
+
+
 if __name__ == "__main__":
     import sys
     fails = 0

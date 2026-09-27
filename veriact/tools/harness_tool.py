@@ -3405,7 +3405,7 @@ def evaluate_problem_detailed(
     with all scores 0 and integrity_failed=True, NOT excluded (counts as a failure).
     No postcondition (D13: no `ensures` clause on the method): all scores 0, no_postcondition=True,
     NOT excluded (counts as a failure); nothing is verified.
-    Unparseable LLM code cannot be checked and is excluded.
+    Unparseable LLM code (target method missing, or not valid Java) is an integrity failure too.
 
     Exclusions (task is returned with excluded=True and all scores 0):
       - F7 : method returns void (no \result to constrain)
@@ -3440,10 +3440,16 @@ def evaluate_problem_detailed(
         llm_parsed = parser.parse(llm_code, bench_parsed["method_name"])
         llm_params = llm_parsed["params"]
     except (ValueError, Exception) as e:
-        # F10: an unparseable submission cannot be trusted to have kept the code
-        return _empty_result(task.task_id, f"llm code unparseable: {e}",
-                             {"class_renamed": None, "signature_changed": None,
-                              "body_modified": None, "reason": str(e)})
+        # F10: the target method is missing (e.g. renamed) or the submission is not valid Java (e.g. a bare
+        # `requires ...;` outside a comment, which OpenJML accepts): the code was not kept, so this is an
+        # integrity failure, scored 0 and kept in the denominators (like a changed body)
+        print(f"INTEGRITY FAILED [{task.task_id}]: llm code unparseable: {e}", file=sys.stderr)
+        res = _empty_result(task.task_id, f"integrity: llm code unparseable: {e}",
+                            {"class_renamed": None, "signature_changed": None, "body_modified": None,
+                             "unparseable": True, "reason": f"llm code unparseable: {e}"})
+        res["excluded"] = False
+        res["integrity_failed"] = True
+        return res
 
     # ---- F10: integrity (class, signature, body unchanged) ----
     integrity = check_integrity(solution_src, llm_code, bench_parsed, llm_parsed)
