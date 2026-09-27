@@ -121,10 +121,14 @@ def result_path(out: str, u: dict) -> str:
 def cmd_run(args) -> int:
     import spec_harness.eval_llm_response as ev
     ev.set_jvm_slots(args.jvm_slots)
+    ev.install_stop_handlers()          # Ctrl-C / kill / closed screen also stop the OpenJML processes
     args.out = os.path.abspath(args.out)
     os.makedirs(args.out, exist_ok=True)
     i, n = C.parse_shard(args.shard)
     all_units = units(args.rq1_dir, args.bench, args.files, args.limit)
+    if args.units_file:                                   # e.g. the T8 sensitivity sample
+        want = {l.strip() for l in open(args.units_file) if l.strip()}
+        all_units = [u for u in all_units if u["unit"] in want]
     mine = [u for u in all_units if C.shard_of(u["unit"], n) == i]
     todo = []
     for u in mine:
@@ -149,6 +153,8 @@ def cmd_run(args) -> int:
             return u, "locked"
         try:
             rec = score_unit(ev, suites[u["bench"]], u, args, info)
+            if ev.STOPPING:                                   # stopped mid-task: redo it on resume
+                return u, "stopped"
             C.atomic_json(result_path(args.out, u), rec)
             return u, rec["status"] + (f" {rec.get('seconds')}s" if "seconds" in rec else "")
         finally:
@@ -181,7 +187,8 @@ def rows_from_results(out: str):
         h = r.get("harness") or {}
         row = {k: r.get(k, "") for k in ("unit", "file", "approach", "bench", "model", "prompt", "task_id", "status")}
         row.update(excluded=h.get("excluded", ""), exclude_reason=h.get("exclude_reason", ""),
-                   integrity_failed=h.get("integrity_failed", False), post_all_unknown=h.get("post_all_unknown", ""),
+                   integrity_failed=h.get("integrity_failed", False),
+                   no_postcondition=h.get("no_postcondition", False), post_all_unknown=h.get("post_all_unknown", ""),
                    not_evaluable=";".join(h.get("not_evaluable", [])), pairs_used=h.get("pairs_used", ""),
                    invalid_inputs_used=h.get("invalid_inputs_used", ""),
                    invalid_inputs_source=h.get("invalid_inputs_source", ""))
@@ -189,7 +196,7 @@ def rows_from_results(out: str):
             x = h.get(m) or {}
             for k in ("score", "passed", "total", "unknowns", "errors", "evaluable"):
                 row[f"{m}_{k}"] = x.get(k, "")
-            if x and x.get("evaluable") is False and not h.get("integrity_failed"):
+            if x and x.get("evaluable") is False and not (h.get("integrity_failed") or h.get("no_postcondition")):
                 row[f"{m}_score"] = ""                    # not evaluable: no score (not 0)
         row.update(seconds=r.get("seconds", ""), host=(r.get("provenance") or {}).get("host", ""),
                    bundle=(r.get("provenance") or {}).get("bundle", ""), error=r.get("error", ""))
@@ -226,6 +233,7 @@ def main() -> int:
             p.add_argument("--workers", type=int, default=0, help="specs in flight (default: jvm-slots / 2)")
             p.add_argument("--openjml", default=os.environ.get("OPENJML", "openjml"))
             p.add_argument("--limit", type=int, default=0, help="first N units per file (smoke tests)")
+            p.add_argument("--units-file", default=None, help="only these unit ids (<file stem>/<task>), one per line")
             p.add_argument("--keep-stubs", choices=["tar", "none"], default="tar")
             p.add_argument("--force", action="store_true")
             p.add_argument("--retry-errors", action="store_true")

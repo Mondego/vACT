@@ -78,6 +78,11 @@ def evaluate_problem(task, llm_code, openjml_path="openjml", output_dir="veriact
             out[k] = 0.0
         notes.append("The method body or signature differs from the original program; "
                      "restore the original code and change only the JML annotations.")
+    elif res.get("no_postcondition"):
+        for k in metrics:
+            out[k] = 0.0
+        notes.append("No JML postcondition: the method has no `ensures` clause, so the specification says "
+                     "nothing about the result. Add `ensures` clauses that describe \\result.")
     elif res.get("excluded"):
         for k in metrics:
             out[k] = None

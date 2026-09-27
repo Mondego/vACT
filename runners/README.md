@@ -41,8 +41,11 @@ python runners/rq3_run.py status --out /data/rq3_out
 - **Unit:** one verified RQ1 spec (`status == verified` and `final_error == ""`, duplicates included), scored on `benchmarks/*/<bench>_v2_eval.json`.
 - **Harness settings:** 10 evaluation pairs plus the evaluation T−, dual accept/refute decisions, 300 s per decision, `exclude_collection_tasks=False`.
 - **Parallelism:** `--jvm-slots` caps the concurrent OpenJML JVMs (2 per decision), and every timer starts at launch.
+- **No postcondition (D13):** a spec without an `ensures` clause on the method scores 0 on all four metrics without running OpenJML (`no_postcondition=True`, kept in the denominators).
+- **Stopping:** Ctrl-C, `kill <pid>` or closing the screen stops the runner **and** every OpenJML/cvc4 process it started. A task interrupted mid-way is not saved.
 - **Resumable:** re-run the same command after any interruption; finished units are skipped.
-- **Splitting:** `--shard i/n` splits the work over several machines or sessions; `--bench sgb` / `--bench fb` works too.
+- **Splitting:** `--shard i/n` splits the work over several machines or sessions; `--bench sgb` / `--bench fb` works too. Two machines: `--shard 0/2` on one and `--shard 1/2` on the other, each with its own `--out`; `collect.py` merges them.
+- **Slots:** about one core per slot (the JVM waits while cvc4 solves). Leave headroom, e.g. `--jvm-slots 96` on a 112-core machine with nothing else running; contention pushes decisions into the 300 s timeout (verdict unknown).
 - **Output:** `results/<file>/<task>.json`, `stubs/<file>/<task>.tar.gz`, `progress.log` (with ETA) and `run_meta.json`.
 
 ## 3. RQ4 (machines 2 and 3)

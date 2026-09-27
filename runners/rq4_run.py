@@ -17,7 +17,9 @@ Phases (each resumable; re-running skips finished tasks):
              veriact: veriact/run/run_single.py, one task per process (own output dir, resumable)
   score      every final Solution.java: OpenJML verification with the agents' verifier (RQ1 command,
              300 s); if verified, Spec-Harness on the evaluation suite (N = 10, dual decisions, 300 s,
-             exclude_collection_tasks=False). Integrity failures count as failures.
+             exclude_collection_tasks=False). Integrity failures count as failures. A file without an
+             `ensures` clause on solve (D13) is not verified (verified=False, status no_postcondition) and
+             scores 0; OpenJML's own result is kept as openjml_verified.
   status     per run: tasks, submissions, scored
   csv        <out>/rq4_per_task.csv
 
@@ -228,10 +230,6 @@ def final_solutions(out, arm, agent, bench):
     return sols
 
 
-class _Done(Exception):
-    """Early exit from scoring one task (the record is already complete)."""
-
-
 def load_verifier():
     spec = importlib.util.spec_from_file_location("verifier_tool", os.path.join(C.REPO, "veriact", "tools", "verifier_tool.py"))
     vt = importlib.util.module_from_spec(spec)
@@ -244,6 +242,7 @@ def cmd_score(args) -> int:
     import spec_harness.eval_llm_response as ev
     ev.set_jvm_slots(args.jvm_slots)
     vt = load_verifier()
+    ev.install_stop_handlers(vt.kill_live_groups)   # Ctrl-C / kill / closed screen also stop OpenJML
     info = C.bundle_info()
     evals = {b: {t["task_id"]: t for t in json.load(open(EVAL[b]))} for b in args.bench}
     todo = []
@@ -274,11 +273,11 @@ def cmd_score(args) -> int:
                 code = open(sol).read()
                 from spec_harness.eval_spec import extract_jml_spec
                 sp = extract_jml_spec(code, "solve")
-                if sp.postcondition is None and not getattr(sp, "has_requires", False):
-                    # no JML at all (e.g. a failed session left the original file): as RQ1's "empty_spec",
-                    # this is not a verified specification
-                    rec.update(status="empty_spec", verified=False)
-                    raise _Done()
+                # D13: no `ensures` on solve (incl. no JML at all, e.g. a failed session left the original
+                # file) says nothing about the result: not verified and all Spec-Harness metrics 0. OpenJML is
+                # still run and recorded as openjml_verified (RQ1's verification-only definition).
+                no_post = sp.postcondition is None
+                rec["no_postcondition"] = no_post
                 t0 = time.time()
                 ev.JVM_SLOTS.acquire(1)
                 try:
@@ -286,9 +285,12 @@ def cmd_score(args) -> int:
                                                 timeout=C.EXPERIMENT_TIMEOUT, output_dir=os.path.join(work_dir, "verify"))
                 finally:
                     ev.JVM_SLOTS.release(1)
-                rec.update(verify_seconds=round(time.time() - t0, 1), verified=bool(vr.success),
+                rec.update(verify_seconds=round(time.time() - t0, 1), openjml_verified=bool(vr.success),
+                           verified=bool(vr.success) and not no_post,
                            verify_timed_out="Timeout:" in (vr.error_log or ""))
-                if not vr.success:
+                if no_post:
+                    rec["status"] = "no_postcondition"
+                elif not vr.success:
                     rec["status"] = "unverified"
                 else:
                     t1 = time.time()
@@ -303,13 +305,12 @@ def cmd_score(args) -> int:
                                 h[m] = {**h[m], "details": [{k: v for k, v in d.items() if k != "stub"}
                                                             for d in h[m].get("details", [])]}
                         rec["harness"] = h
-        except _Done:
-            pass
         except Exception as e:
             rec.update(status="error", error=f"{type(e).__name__}: {e}", traceback=traceback.format_exc()[-3000:])
         finally:
             rec["finished"] = C.now()
-            C.atomic_json(res, rec)
+            if not ev.STOPPING:                     # stopped mid-task: nothing saved, redone on resume
+                C.atomic_json(res, rec)
             shutil.rmtree(work_dir, ignore_errors=True)
             C.unlock(lock)
         return tid, rec["status"]
@@ -339,15 +340,17 @@ def cmd_csv(args) -> int:
     for p in sorted(glob.glob(os.path.join(args.out, "*", "_scores", "*", "*.json"))):
         r = json.load(open(p))
         h = r.get("harness") or {}
-        row = {k: r.get(k, "") for k in ("arm", "agent", "bench", "task_id", "status", "verified", "verify_timed_out",
+        row = {k: r.get(k, "") for k in ("arm", "agent", "bench", "task_id", "status", "verified", "openjml_verified",
+                                          "no_postcondition", "verify_timed_out",
                                           "verify_seconds", "harness_seconds")}
-        row.update(integrity_failed=h.get("integrity_failed", False), excluded=h.get("excluded", ""),
+        row.update(integrity_failed=h.get("integrity_failed", False),
+                   no_postcondition=h.get("no_postcondition", False), excluded=h.get("excluded", ""),
                    post_all_unknown=h.get("post_all_unknown", ""), not_evaluable=";".join(h.get("not_evaluable", [])))
         for m in METRICS:
             x = h.get(m) or {}
             for k in ("score", "passed", "total", "unknowns", "errors", "evaluable"):
                 row[f"{m}_{k}"] = x.get(k, "")
-            if x and x.get("evaluable") is False and not h.get("integrity_failed"):
+            if x and x.get("evaluable") is False and not (h.get("integrity_failed") or h.get("no_postcondition")):
                 row[f"{m}_score"] = ""                    # not evaluable: no score (not 0)
         row.update(host=(r.get("provenance") or {}).get("host", ""), bundle=(r.get("provenance") or {}).get("bundle", ""))
         rows.append(row)

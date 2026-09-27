@@ -496,6 +496,23 @@ def test_output_mutants_stay_in_type_range():
     assert m.mutate(J("int[]"), [1, 2]) == [[1], [1, 2, 3], [2, 3], []]
 
 
+def test_spec_without_ensures_scores_zero_everywhere():
+    """D13: no ensures on the method (no JML at all, or requires only) = all four metrics 0, evaluable,
+    not excluded, and no OpenJML run (the openjml path does not exist)."""
+    import json, re, tempfile
+    from spec_harness.eval_llm_response import Task, evaluate_problem
+    t = next(x for x in json.load(open("benchmarks/specgenbench/sgb_v2_eval.json")) if x["task_id"] == "SGB_Abs")
+    requires_only = re.sub(r"(\n(\s*)(public|static)[^\n]*\bsolve\s*\()", r"\n\2//@ requires true;\1",
+                           t["code"], count=1)
+    assert "//@ requires true;" in requires_only
+    for code in (t["code"], requires_only):
+        res = evaluate_problem(Task.from_dict(t), code, openjml_path="/nonexistent/openjml",
+                               output_dir=tempfile.mkdtemp(), max_pairs=0, exclude_collection_tasks=False)
+        assert res["no_postcondition"] is True and res["excluded"] is False, res
+        for m in ("post_correctness", "post_completeness", "pre_correctness", "pre_completeness"):
+            assert res[m]["evaluable"] is True and res[m]["score"] == 0.0, (m, res[m])
+
+
 if __name__ == "__main__":
     import sys
     fails = 0

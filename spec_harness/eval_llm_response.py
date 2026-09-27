@@ -19,6 +19,7 @@ Phase-0 fixes in this version:
   F8  missing `requires` policy (flag --missing-requires-policy)
   F10 class / signature / body integrity check (token-level); a modified submission
       is kept with all scores 0 (integrity_failed=True), i.e. counted as a failure
+  D13 no `ensures` on the method: kept with all scores 0 (no_postcondition=True), not verified
 
 Usage
 -----
@@ -39,6 +40,7 @@ import os
 import re
 import json
 import argparse
+import atexit
 import signal
 import subprocess
 import sys
@@ -201,6 +203,60 @@ def set_jvm_slots(n: int) -> None:
         JVM_SLOTS.cv.notify_all()
 
 
+# Every OpenJML call runs in its own session (setsid) so that a timeout kills the whole tree (wrapper
+# script, JVM, cvc4). Such a group does not receive the caller's Ctrl-C or kill, so the live groups are
+# tracked and killed when this process exits or is stopped; otherwise they outlive a stopped run.
+_LIVE_GROUPS: set[int] = set()
+_LIVE_LOCK = threading.Lock()
+STOPPING = False                      # set by the stop handler: results computed from now on are not saved
+
+
+def _track(p: subprocess.Popen) -> None:
+    with _LIVE_LOCK:
+        _LIVE_GROUPS.add(p.pid)       # setsid: the group id is the child's pid
+
+
+def _kill_group(p: subprocess.Popen) -> None:
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    with _LIVE_LOCK:
+        _LIVE_GROUPS.discard(p.pid)
+
+
+def kill_live_groups() -> None:
+    with _LIVE_LOCK:
+        groups = list(_LIVE_GROUPS)
+    for g in groups:
+        try:
+            os.killpg(g, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+atexit.register(kill_live_groups)
+
+
+def install_stop_handlers(*also) -> None:
+    """For long runs (call from the main thread): on SIGINT / SIGTERM / SIGHUP kill every live OpenJML
+    group (and call each function in `also`), then exit at once. Nothing is written after the signal, so
+    no half-scored task is saved; the task is redone on resume (its lock belongs to a dead process)."""
+    def stop(signum, frame):
+        global STOPPING
+        STOPPING = True
+        kill_live_groups()
+        for f in also:
+            try:
+                f()
+            except Exception:
+                pass
+        print(f"stopped by signal {signum}: OpenJML processes killed", file=sys.stderr, flush=True)
+        os._exit(128 + signum)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, stop)
+
+
 class OpenJMLRunnerPersistent:
     """Runs OpenJML ESC, writing harness stubs to an actual directory."""
 
@@ -250,6 +306,7 @@ class OpenJMLRunnerPersistent:
         except Exception:
             JVM_SLOTS.release(1)
             raise
+        _track(proc)
         try:
             stdout, stderr = proc.communicate(timeout=self.timeout)
             returncode = proc.returncode
@@ -262,10 +319,7 @@ class OpenJMLRunnerPersistent:
         except Exception as e:
             return VerifyResult.UNKNOWN, f"Error: {str(e)}"
         finally:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            _kill_group(proc)
             JVM_SLOTS.release(1)
 
     @staticmethod
@@ -304,13 +358,11 @@ class OpenJMLRunnerPersistent:
                 out = open(os.path.join(d, "openjml.out"), "w")
                 p = subprocess.Popen(self._cmd(path), stdout=out, stderr=subprocess.STDOUT,
                                      text=True, preexec_fn=os.setsid)
+                _track(p)
                 procs[side] = (p, out, os.path.join(d, "openjml.out"))
         except Exception:                         # launch failed: stop what started, free the slots
             for p, out, _ in procs.values():
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+                _kill_group(p)
                 out.close()
             JVM_SLOTS.release(2)
             raise
@@ -336,10 +388,7 @@ class OpenJMLRunnerPersistent:
             return "unknown", info
         finally:
             for side, (p, out, _) in procs.items():
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+                _kill_group(p)
                 try:
                     out.close()
                 except Exception:
@@ -506,7 +555,7 @@ def _evaluate_one_pair_dual(
         decision, info = runner.decide(stubs[0], stubs[1], cname, lbl)
         return decision, info, stubs[0]
 
-    if spec.postcondition is not None:
+    if spec.postcondition is not None:         # always true here: D13 returns earlier without ensures
         # PostCorrectness: the spec must accept the true output
         d, info, stub = post_check(pair.output, f"post_correct_{pair.label}")
         if d is not None:
@@ -612,6 +661,8 @@ def evaluate_problem(
 
     Integrity failure (F10: class name, signature, or method body changed): returned
     with all scores 0 and integrity_failed=True, NOT excluded (counts as a failure).
+    No postcondition (D13: no `ensures` clause on the method): all scores 0, no_postcondition=True,
+    NOT excluded (counts as a failure); nothing is verified.
     Unparseable LLM code cannot be checked and is excluded.
 
     Exclusions (task is returned with excluded=True and all scores 0):
@@ -641,10 +692,6 @@ def evaluate_problem(
     # target = the benchmark's method (normally `solve`), even if the LLM added
     # helper methods before it
     spec = extract_jml_spec(llm_code, bench_parsed["method_name"])
-    if spec.postcondition is None: # preconditions are optional, but postconditions are required
-        print(
-            f"WARNING [{task.task_id}]: no JML ensures found", file=sys.stderr
-        )
 
     # ---- parse LLM method signature ----
     try:
@@ -689,6 +736,19 @@ def evaluate_problem(
         return _empty_result(task.task_id, f"unsupported_type: {why}", integrity,
                              {"has_collection_param": has_coll_param,
                               "has_collection_return": has_coll_ret})
+
+    # ---- D13: no postcondition (no `ensures` on the method) ----
+    # A specification without a postcondition says nothing about the result: all four metrics are 0,
+    # nothing is verified, and the task stays in the denominators (excluded=False), like an integrity
+    # failure. A missing `requires` alone is fine (precondition true).
+    if spec.postcondition is None:
+        print(f"NOTE [{task.task_id}]: no JML ensures clause: all metrics 0", file=sys.stderr)
+        res = _empty_result(task.task_id, "no_postcondition", integrity)
+        res["excluded"] = False
+        res["no_postcondition"] = True
+        for k in ("post_correctness", "post_completeness", "pre_correctness", "pre_completeness"):
+            res[k]["evaluable"] = True
+        return res
 
     # detect input format from Test.java
     read_ops = detect_input_format(test_src, bench_params)
@@ -1019,6 +1079,7 @@ def run_batch(
         "total_scored": len(all_results) - len(excluded),
         "total_excluded": len(excluded),
         "total_integrity_failed": sum(1 for r in all_results if r.get("integrity_failed")),
+        "total_no_postcondition": sum(1 for r in all_results if r.get("no_postcondition")),
         "excluded_by_reason": {},
         "total_verified_responses": len(responses),
         "policy": {

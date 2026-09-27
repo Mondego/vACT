@@ -46,7 +46,7 @@ THRESHOLDS = (0.25, 0.5, 0.75, 1.0)
 def metric_values(rec: dict) -> dict:
     """metric -> score (float) or None (not evaluable)."""
     h = rec.get("harness") or {}
-    if h.get("integrity_failed"):
+    if h.get("integrity_failed") or h.get("no_postcondition"):
         return {m: 0.0 for m in METRICS}
     out = {}
     for m in METRICS:
@@ -96,7 +96,8 @@ def cmd_rq3(a) -> int:
         v = metric_values(r) if r.get("status") == "scored" else {m: None for m in METRICS}
         h = r.get("harness") or {}
         row = {k: r.get(k, "") for k in ("unit", "file", "approach", "bench", "model", "prompt", "task_id", "status")}
-        row.update(integrity_failed=h.get("integrity_failed", False), excluded=h.get("excluded", ""),
+        row.update(integrity_failed=h.get("integrity_failed", False),
+                   no_postcondition=h.get("no_postcondition", False), excluded=h.get("excluded", ""),
                    exclude_reason=h.get("exclude_reason", ""), post_all_unknown=h.get("post_all_unknown", ""))
         for m in METRICS:
             x = h.get(m) or {}
@@ -169,7 +170,8 @@ def cmd_rq4(a) -> int:
         v = metric_values(r) if r.get("status") == "scored" else {m: None for m in METRICS}
         h = r.get("harness") or {}
         row = {x: r.get(x, "") for x in ("arm", "agent", "bench", "task_id", "status", "verified")}
-        row.update(integrity_failed=h.get("integrity_failed", False), post_all_unknown=h.get("post_all_unknown", ""))
+        row.update(integrity_failed=h.get("integrity_failed", False),
+                   no_postcondition=h.get("no_postcondition", False), post_all_unknown=h.get("post_all_unknown", ""))
         for m in METRICS:
             row[SHORT[m]] = "" if v[m] is None else v[m]
         row.update(host=(r.get("provenance") or {}).get("host", ""), bundle=(r.get("provenance") or {}).get("bundle", ""))

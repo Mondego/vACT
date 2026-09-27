@@ -8,6 +8,7 @@ in the T5 evaluation list, so "the first N pairs" = labels case_0 .. case_<N-1>:
   PostCorr / PostComp / PreCorr   checks of pairs with rank < N
   PreComp                         always the full validated T- (independent of N)
 Undecided checks (unknown / error) are excluded from each metric's denominator (as in the harness).
+Integrity failures and specs without a postcondition (no_postcondition) score 0 at every N.
 A metric with no decided check is not evaluable for that task.
 
 Post-Harness@tau (as in rescore_rq4.py): PostCorr >= tau and PostComp >= tau. Denominator: all tasks
@@ -55,8 +56,10 @@ def main():
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     results = []
-    for f in sorted(glob.glob(os.path.join(a.result_dir, "*.json"))):
+    for f in sorted(glob.glob(os.path.join(a.result_dir, "**", "*.json"), recursive=True)):
         r = json.load(open(f))
+        if isinstance(r, dict) and isinstance(r.get("harness"), dict):     # runners/rq3_run.py result
+            r = {**r["harness"], "task_id": r.get("unit", r["harness"].get("task_id"))}
         if isinstance(r, dict) and "task_id" in r and "post_correctness" in r:
             results.append(r)
     table = {"tasks": len(results), "per_n": {}}
@@ -65,8 +68,8 @@ def main():
         for r in results:
             if r.get("excluded") and not r.get("integrity_failed"):
                 continue
-            s = at_n(r, n) if not r.get("integrity_failed") else {m: {"score": 0.0, "decided": 1, "unknown": 0}
-                                                                   for m in METRICS}
+            zero = r.get("integrity_failed") or r.get("no_postcondition")     # scored 0, nothing checked
+            s = at_n(r, n) if not zero else {m: {"score": 0.0, "decided": 1, "unknown": 0} for m in METRICS}
             rows.append((r["task_id"], s))
         entry = {"tasks_scored": len(rows)}
         for m in METRICS:
