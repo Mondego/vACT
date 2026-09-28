@@ -309,6 +309,7 @@ class Model:
         ts_start = datetime.datetime.now().isoformat(timespec="milliseconds")
         t0 = time.time()
         msg, err = None, None
+        _TLS.last_request_params = None      # set by generate() to the non-message request kwargs it sent
         try:
             msg = self.generate(*args, **kwargs)
             return msg
@@ -328,6 +329,9 @@ class Model:
                     "ts_start": ts_start,
                     "latency_s": latency,
                     "model_id": self.model_id,
+                    "reasoning_effort": getattr(self, "reasoning_effort", None),
+                    # the request kwargs actually sent to the API, except the messages (logged separately)
+                    "request_params": getattr(_TLS, "last_request_params", None),
                     "stop_sequences": kwargs.get("stop_sequences"),
                     "request_messages": messages,
                     "response_content": getattr(msg, "content", None) if msg is not None else None,
@@ -358,7 +362,8 @@ class Model:
 
     def to_dict(self) -> dict:
         d = {**self.kwargs, "last_input_token_count": self.last_input_token_count, "last_output_token_count": self.last_output_token_count, "model_id": self.model_id}
-        for attr in ["custom_role_conversion", "temperature", "max_tokens", "provider", "timeout", "api_base"]:
+        for attr in ["custom_role_conversion", "temperature", "max_tokens", "provider", "timeout", "api_base",
+                     "reasoning_effort"]:
             if hasattr(self, attr):
                 d[attr] = getattr(self, attr)
         return d
@@ -385,16 +390,30 @@ class ApiModel(Model):
 # OpenAI (also used as base for vLLM)
 
 class OpenAIServerModel(ApiModel):
-    def __init__(self, model_id: str, api_base=None, api_key=None, organization=None, project=None, client_kwargs=None, custom_role_conversions=None, flatten_messages_as_text=False, **kwargs):
+    """OpenAI chat.completions backend.
+
+    reasoning_effort: sent as the `reasoning_effort` request parameter on every call when not None
+    (e.g. "medium" for gpt-5.4, the effort Codex runs it at in RQ4).
+    """
+
+    def __init__(self, model_id: str, api_base=None, api_key=None, organization=None, project=None, client_kwargs=None, custom_role_conversions=None, flatten_messages_as_text=False, reasoning_effort: str | None = None, **kwargs):
         self.client_kwargs = {**(client_kwargs or {}), "api_key": api_key, "base_url": api_base, "organization": organization, "project": project}
+        self.reasoning_effort = reasoning_effort
         super().__init__(model_id=model_id, custom_role_conversions=custom_role_conversions, flatten_messages_as_text=flatten_messages_as_text, **kwargs)
 
     def create_client(self):
         import openai
         return openai.OpenAI(**self.client_kwargs)
 
+    def build_request_kwargs(self, messages, stop_sequences=None, grammar=None, tools_to_call_from=None, **kwargs) -> dict:
+        """The exact kwargs passed to client.chat.completions.create (no API call)."""
+        if self.reasoning_effort is not None:
+            kwargs.setdefault("reasoning_effort", self.reasoning_effort)
+        return self._prepare_completion_kwargs(messages=messages, stop_sequences=stop_sequences, grammar=grammar, tools_to_call_from=tools_to_call_from, model=self.model_id, custom_role_conversions=self.custom_role_conversions, **kwargs)
+
     def generate(self, messages, stop_sequences=None, grammar=None, tools_to_call_from=None, **kwargs) -> ChatMessage:
-        ckw = self._prepare_completion_kwargs(messages=messages, stop_sequences=stop_sequences, grammar=grammar, tools_to_call_from=tools_to_call_from, model=self.model_id, custom_role_conversions=self.custom_role_conversions, **kwargs)
+        ckw = self.build_request_kwargs(messages, stop_sequences=stop_sequences, grammar=grammar, tools_to_call_from=tools_to_call_from, **kwargs)
+        _TLS.last_request_params = {k: v for k, v in ckw.items() if k != "messages"}
         response = self.client.chat.completions.create(**ckw)
         self.last_input_token_count = response.usage.prompt_tokens
         self.last_output_token_count = response.usage.completion_tokens

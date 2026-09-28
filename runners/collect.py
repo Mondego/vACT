@@ -101,8 +101,13 @@ def post_all_unknown(rec: dict):
 
 
 def check_pairs(recs: dict) -> None:
-    """--pairs N needs results scored with at least N pairs (pairs 0 = all of the suite's, >= 10)."""
+    """--pairs N needs results scored with at least N pairs (pairs 0 = all of the suite's, >= 10); without
+    --pairs every result must have been scored with the same pair count."""
     if not PAIRS:
+        used = collections.Counter(r.get("pairs", 0) for r in recs.values() if r.get("status") == "scored")
+        if len(used) > 1:
+            raise SystemExit(f"results were scored with different pair counts {dict(used)}: "
+                             f"use --pairs <smallest> to re-score all of them from the same prefix")
         return
     few = [k for k, r in recs.items() if r.get("status") == "scored" and 0 < (r.get("pairs") or 0) < PAIRS]
     if few:
@@ -127,7 +132,9 @@ def merge(ins, sub, key_fn, out_dir):
             k = key_fn(rec)
             if k in seen:
                 conflicts.append({"key": k, "a": seen[k], "b": p})
-                continue
+                # prefer a scored result over a failed one (the same unit run on two machines)
+                if json.load(open(seen[k])).get("status") == "scored" or rec.get("status") != "scored":
+                    continue
             seen[k] = p
             dst = os.path.join(out_dir, "merged", os.path.relpath(p, d))
             os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -137,11 +144,26 @@ def merge(ins, sub, key_fn, out_dir):
 
 # ------------------------------------------------------------------ RQ3
 
+def fresh_outputs(out: str, names) -> None:
+    """Remove CSVs / reports of an earlier collect, so no stale file survives a partial run."""
+    for n in names:
+        try:
+            os.remove(os.path.join(out, n))
+        except FileNotFoundError:
+            pass
+
+
 def cmd_rq3(a) -> int:
     import rq3_run
     os.makedirs(a.out, exist_ok=True)
-    seen, conflicts = merge(a.inputs, os.path.join("results", "*", "*.json"), lambda r: r["unit"], a.out)
+    fresh_outputs(a.out, ("rq3_per_spec.csv", "rq3_fig4_cells.csv", "rq3_by_config.csv", "rq3_collect_report.json"))
+    n_files = len(glob.glob(os.path.join(a.rq1_dir, "*.jsonl")))
     expected = {u["unit"]: u for u in rq3_run.units(a.rq1_dir, ["sgb", "fb"], None, 0)}
+    if n_files != 136 or len(expected) != 14881:
+        raise SystemExit(f"--rq1-dir {a.rq1_dir}: {n_files} files / {len(expected)} units, expected 136 / 14881 "
+                         f"(point it at the RQ1 outputs, e.g. <bundle>/inputs/rq1 or artifacts/rq1)")
+    seen, conflicts = merge(a.inputs, os.path.join("results", "*", "*.json"), lambda r: r["unit"], a.out)
+    seen = {k: v for k, v in seen.items() if k in expected}   # unexpected units never enter a numerator
     recs = {k: json.load(open(p)) for k, p in seen.items()}
     check_pairs(recs)
     rows = []
@@ -233,25 +255,44 @@ def cmd_rq3(a) -> int:
     write_csv(os.path.join(a.out, "rq3_by_config.csv"), conf)
 
     report = {"expected_units": len(expected), "present": len(recs),
+              "reused_copies": sum(1 for r in recs.values() if r.get("reused_from")),
               "missing": sorted(set(expected) - set(recs))[:200], "n_missing": len(set(expected) - set(recs)),
               "unexpected": sorted(set(recs) - set(expected))[:50],
               "status": dict(collections.Counter(r.get("status") for r in recs.values())),
               "bundles": dict(collections.Counter((r.get("provenance") or {}).get("bundle") for r in recs.values())),
               "hosts": dict(collections.Counter((r.get("provenance") or {}).get("host") for r in recs.values())),
               "duplicate_units_across_inputs": conflicts[:50], "n_conflicts": len(conflicts)}
+    bad = {k: r.get("status") for k, r in recs.items() if r.get("status") != "scored"}
+    report["not_scored"] = dict(collections.Counter(bad.values()))
+    report["not_scored_units"] = sorted(bad)[:200]
     C.atomic_json(os.path.join(a.out, "rq3_collect_report.json"), report)
-    print(json.dumps({k: v for k, v in report.items() if k not in ("missing", "unexpected", "duplicate_units_across_inputs")}, indent=1))
+    print(json.dumps({k: v for k, v in report.items() if k not in ("missing", "unexpected", "duplicate_units_across_inputs",
+                                                                   "not_scored_units")}, indent=1))
     if len(report["bundles"]) > 1:
         print("WARNING: results come from different bundles")
+    if (report["n_missing"] or bad) and not a.allow_incomplete:
+        print(f"INCOMPLETE: {report['n_missing']} units missing, {len(bad)} not scored {report['not_scored']} "
+              f"(see rq3_collect_report.json); they count as not meeting any tau. Finish or retry the runs "
+              f"(rq3_run.py run --retry-errors), or pass --allow-incomplete for a preliminary collect.")
+        return 4
     return 0
 
 
 # ------------------------------------------------------------------ RQ4
 
+RQ4_RUNS = [(arm, agent, bench) for arm in ("with_harness", "no_harness") for agent in ("claude", "codex", "veriact")
+            for bench in ("sgb", "fb")]
+
+
 def cmd_rq4(a) -> int:
     os.makedirs(a.out, exist_ok=True)
+    fresh_outputs(a.out, ("rq4_per_task.csv", "rq4_summary.csv", "rq4_collect_report.json"))
     seen, conflicts = merge(a.inputs, os.path.join("*", "_scores", "*", "*.json"),
                             lambda r: f"{r['arm']}/{r['agent']}_{r['bench']}/{r['task_id']}", a.out)
+    tasks = {b: [t["task_id"] for t in json.load(open(os.path.join(C.REPO, "benchmarks", rel)))]
+             for b, rel in SUITE_FILES["rq4"].items()}
+    expected = {f"{arm}/{agent}_{bench}/{tid}" for arm, agent, bench in RQ4_RUNS for tid in tasks[bench]}
+    seen = {k: v for k, v in seen.items() if k in expected}
     recs = {k: json.load(open(p)) for k, p in seen.items()}
     check_pairs(recs)
     rows = []
@@ -259,9 +300,11 @@ def cmd_rq4(a) -> int:
         r = recs[k]
         v = metric_values(r) if r.get("status") == "scored" else {m: None for m in METRICS}
         h = r.get("harness") or {}
-        row = {x: r.get(x, "") for x in ("arm", "agent", "bench", "task_id", "status", "verified")}
-        row.update(integrity_failed=h.get("integrity_failed", False),
-                   no_postcondition=h.get("no_postcondition", False), post_all_unknown=post_all_unknown(r))
+        row = {x: r.get(x, "") for x in ("arm", "agent", "bench", "task_id", "status", "verified", "openjml_verified",
+                                          "verify_timed_out", "restored", "final_source")}
+        row.update(integrity_failed=bool(r.get("integrity_failed") or h.get("integrity_failed")),
+                   no_postcondition=bool(r.get("no_postcondition") or h.get("no_postcondition")),
+                   post_all_unknown=post_all_unknown(r))
         for m in METRICS:
             row[SHORT[m]] = "" if v[m] is None else v[m]
         row.update(host=(r.get("provenance") or {}).get("host", ""), bundle=(r.get("provenance") or {}).get("bundle", ""))
@@ -272,12 +315,17 @@ def cmd_rq4(a) -> int:
     groups = collections.defaultdict(list)
     for r in rows:
         groups[(r["arm"], r["agent"], r["bench"])].append(r)
-    for (arm, agent, bench), rs in sorted(groups.items()):
+    for arm, agent, bench in RQ4_RUNS:                   # all 12 runs, present or not
+        rs = groups.get((arm, agent, bench), [])
         n, n_pre = sizes[bench]
         ok_rs = [r for r in rs if r["verified"] is True]          # unverified: no metric meets any tau
         s = {"arm": arm, "agent": agent, "bench": bench, "tasks": n, "tasks_with_tminus": n_pre,
              "task_records": len(rs), "verified": len(ok_rs)}
         s["VR"] = round(len(ok_rs) / n, 4)
+        s["missing_tasks"] = n - len(rs)
+        for st_ in ("scored", "unverified", "no_postcondition", "integrity_failed", "no_solution", "error",
+                    "no_pairs_parsed"):
+            s[f"status_{st_}"] = sum(1 for r in rs if r["status"] == st_)
         s["post_all_unknown"] = sum(1 for r in rs if r["post_all_unknown"] is True)
         s["no_postcondition"] = sum(1 for r in rs if r["no_postcondition"] is True)
         s["integrity_failed"] = sum(1 for r in rs if r["integrity_failed"] is True)
@@ -292,12 +340,19 @@ def cmd_rq4(a) -> int:
                                                  / (n_pre if m == "pre_completeness" else n), 4)
         summ.append(s)
     write_csv(os.path.join(a.out, "rq4_summary.csv"), summ)
-    report = {"present": len(recs), "status": dict(collections.Counter(r.get("status") for r in recs.values())),
+    missing = sorted(expected - set(recs))
+    report = {"expected": len(expected), "present": len(recs), "n_missing": len(missing), "missing": missing[:300],
+              "status": dict(collections.Counter(r.get("status") for r in recs.values())),
               "bundles": dict(collections.Counter((r.get("provenance") or {}).get("bundle") for r in recs.values())),
               "hosts": dict(collections.Counter((r.get("provenance") or {}).get("host") for r in recs.values())),
               "n_conflicts": len(conflicts)}
     C.atomic_json(os.path.join(a.out, "rq4_collect_report.json"), report)
-    print(json.dumps(report, indent=1))
+    print(json.dumps({k: v for k, v in report.items() if k != "missing"}, indent=1))
+    errors = sum(1 for r in recs.values() if r.get("status") in ("error", "no_pairs_parsed"))
+    if (missing or errors) and not a.allow_incomplete:
+        print(f"INCOMPLETE: {len(missing)} task records missing, {errors} errors (see rq4_collect_report.json); "
+              f"finish the runs or pass --allow-incomplete for a preliminary collect.")
+        return 4
     return 0
 
 
@@ -308,12 +363,16 @@ def main() -> int:
     p3.add_argument("--in", dest="inputs", nargs="+", required=True)
     p3.add_argument("--out", required=True)
     p3.add_argument("--rq1-dir", default=os.path.join(C.REPO, "inputs", "rq1"))
+    p3.add_argument("--allow-incomplete", action="store_true",
+                    help="write the CSVs even if units are missing or failed (preliminary numbers)")
     p3.add_argument("--pairs", type=int, default=0,
                     help="re-score from the first N evaluation pairs (results must have >= N; 0 = as scored)")
     p3.set_defaults(func=cmd_rq3)
     p4 = sub.add_parser("rq4")
     p4.add_argument("--in", dest="inputs", nargs="+", required=True)
     p4.add_argument("--out", required=True)
+    p4.add_argument("--allow-incomplete", action="store_true",
+                    help="write the CSVs even if task records are missing or failed (preliminary numbers)")
     p4.add_argument("--pairs", type=int, default=0,
                     help="re-score from the first N evaluation pairs (results must have >= N; 0 = as scored)")
     p4.set_defaults(func=cmd_rq4)

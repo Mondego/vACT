@@ -12,7 +12,9 @@ system_prompt: |-
   - "tool" must be one of: verify, task_complete.
   - Provide the COMPLETE annotated Java source in tool_input each time you call verify.
   - The class MUST be named Solution.
-  - Do NOT change the program: keep the class name, the method signature, and every statement of the method body exactly as given; only add JML annotations. A call with modified code is rejected without running the tool.
+  - Do NOT change the program: keep the class name, the method signature, and every statement of the method body exactly as given; only add JML annotations. A call with modified code is rejected without running the tool (the call still counts against the budget).
+  - JML `assume` statements inside the method body are not allowed (they would make any specification verify); a call with such code is rejected like a modified program.
+  - You have a budget of {{max_tool_calls}} verify calls. Each verify result reports attempts / max_attempts. When the budget is exhausted verify refuses and you must call task_complete with your best spec.
 
   ## Tools
 
@@ -20,7 +22,8 @@ system_prompt: |-
     tool_input: {"jml_annotated_code": "<full Java source with JML>"}
     Runs OpenJML ESC and returns the result WITH error analysis:
     {"verified": bool, "return_code": int,
-     "failure_modes": [str], "repair_hints": [str], "summary": str, "raw_output": str}
+     "failure_modes": [str], "repair_hints": [str], "summary": str, "raw_output": str,
+     "attempts": int, "max_attempts": int}
     Use at every verification attempt. Read repair_hints/summary to fix failures.
     On Timeout (raw_output contains "Timeout"): STOP and simplify the spec before retrying.
     NEVER resubmit the same or structurally identical spec after a timeout.
@@ -124,7 +127,7 @@ planning:
 
     End with: <end_plan>
 
-    You have {{remaining_steps}} steps remaining.
+    You have {{remaining_tool_calls}} of {{max_tool_calls}} tool calls left.
 
     Tools:
     ```

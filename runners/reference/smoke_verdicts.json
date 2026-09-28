@@ -1,6 +1,6 @@
 {
  "provenance": {
-  "bundle": "src-540cb26f2dba6b86",
+  "bundle": "src-173b1d89886dd9b5",
   "host": "styx.ics.uci.edu",
   "python": "3.12.8",
   "openjml": "21-0.21",
@@ -217,6 +217,5 @@
    "pre_completeness|inv_0|": "reject",
    "pre_completeness|inv_1|": "reject"
   }
- },
- "recorded": "2026-09-27T12:33:32"
+ }
 }

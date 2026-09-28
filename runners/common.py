@@ -18,6 +18,8 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 OPENJML_VERSION = "21-0.21"                          # the version every RQ1/RQ3/RQ4 run uses
+# OpenJML's JVM options, identical in every phase and on every machine (the wrapper script reads it)
+os.environ.setdefault("OPENJML_JVM", "-Xmx8g")
 EXPERIMENT_TIMEOUT = 300                              # seconds, every verification in every experiment
 
 
@@ -51,30 +53,52 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _proc_start(pid: int) -> str:
+    """Start time of a process (clock ticks since boot, /proc/<pid>/stat field 22); "" if unknown. With the
+    pid it identifies a process even after its pid has been reused."""
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return ""
+
+
 def try_lock(path: str, stale_hours: float = 12.0) -> bool:
-    """Claim a work unit. A lock whose owner (same host) is dead, or that is older than stale_hours
-    (another host), is taken over. Returns False if someone else holds it."""
+    """Claim a work unit. The lock file is created atomically with its content (host:pid:process start:time,
+    written to a temporary file and hard-linked into place). A lock is stale, and taken over, when its owner
+    is on this host and that process no longer exists (pid dead, or reused by another process), or when it
+    is older than stale_hours (owner on another host). Returns False if someone else holds it."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    me = f"{socket.gethostname()}:{os.getpid()}:{time.time():.0f}"
-    for _ in range(2):
+    me = f"{socket.gethostname()}:{os.getpid()}:{_proc_start(os.getpid())}:{time.time():.0f}"
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    for _ in range(3):
+        with open(tmp, "w") as fh:
+            fh.write(me)
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, me.encode())
-            os.close(fd)
+            os.link(tmp, path)
             return True
         except FileExistsError:
+            pass
+        finally:
             try:
-                host, pid, ts = open(path).read().split(":")
-                stale = (host == socket.gethostname() and not _pid_alive(int(pid))) or \
-                        (time.time() - float(ts) > stale_hours * 3600)
-            except (ValueError, OSError):
-                stale = True
-            if not stale:
-                return False
-            try:
-                os.remove(path)
+                os.remove(tmp)
             except FileNotFoundError:
                 pass
+        try:
+            host, pid, start, ts = open(path).read().split(":")
+            pid = int(pid)
+            if host == socket.gethostname():
+                stale = not _pid_alive(pid) or (start and _proc_start(pid) != start)
+            else:
+                stale = time.time() - float(ts) > stale_hours * 3600
+        except (ValueError, OSError):
+            stale = True                      # unreadable / old-format lock
+        if not stale:
+            return False
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
     return False
 
 

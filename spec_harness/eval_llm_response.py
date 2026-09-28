@@ -51,6 +51,7 @@ from typing import Any
 
 import spec_harness.harness as harness_cfg          # policy flags (F4, F8)
 from spec_harness.harness import (
+    java_comments,
     MethodSpec,
     TestPair,
     InputCase,
@@ -65,6 +66,7 @@ from spec_harness.harness import (
     check_integrity,           # F10
 )
 from spec_harness.eval_spec import (
+    detect_output_layout,
     extract_jml_spec,
     detect_input_format,
     parse_input,
@@ -194,12 +196,17 @@ class JvmSlots:
             self.cv.notify_all()
 
 
-JVM_SLOTS = JvmSlots(int(os.environ.get("SPEC_HARNESS_JVM_SLOTS", "0") or 0))
+def _slots(n: int) -> int:
+    """0 = no cap; otherwise at least 2 (a dual decision needs 2 slots at once, 1 would deadlock)."""
+    return 0 if n <= 0 else max(2, n)
+
+
+JVM_SLOTS = JvmSlots(_slots(int(os.environ.get("SPEC_HARNESS_JVM_SLOTS", "0") or 0)))
 
 
 def set_jvm_slots(n: int) -> None:
     with JVM_SLOTS.cv:
-        JVM_SLOTS.n = n
+        JVM_SLOTS.n = _slots(n)
         JVM_SLOTS.cv.notify_all()
 
 
@@ -211,9 +218,15 @@ _LIVE_LOCK = threading.Lock()
 STOPPING = False                      # set by the stop handler: results computed from now on are not saved
 
 
-def _track(p: subprocess.Popen) -> None:
+def _launch(cmd: list, **kw) -> subprocess.Popen:
+    """Start an OpenJML process in its own session and track its group, atomically with respect to the
+    stop handler: once stopping, nothing new is launched."""
     with _LIVE_LOCK:
+        if STOPPING:
+            raise RuntimeError("stopping: no new OpenJML runs")
+        p = subprocess.Popen(cmd, preexec_fn=os.setsid, **kw)
         _LIVE_GROUPS.add(p.pid)       # setsid: the group id is the child's pid
+        return p
 
 
 def _kill_group(p: subprocess.Popen) -> None:
@@ -244,7 +257,8 @@ def install_stop_handlers(*also) -> None:
     no half-scored task is saved; the task is redone on resume (its lock belongs to a dead process)."""
     def stop(signum, frame):
         global STOPPING
-        STOPPING = True
+        with _LIVE_LOCK:
+            STOPPING = True           # no launch after this point (_launch checks it under the lock)
         kill_live_groups()
         for f in also:
             try:
@@ -252,6 +266,7 @@ def install_stop_handlers(*also) -> None:
             except Exception:
                 pass
         print(f"stopped by signal {signum}: OpenJML processes killed", file=sys.stderr, flush=True)
+        kill_live_groups()            # again: a group registered while the first pass ran
         os._exit(128 + signum)
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, stop)
@@ -296,17 +311,10 @@ class OpenJMLRunnerPersistent:
         ]
         JVM_SLOTS.acquire(1)
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                preexec_fn=os.setsid,
-            )
+            proc = _launch(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except Exception:
             JVM_SLOTS.release(1)
             raise
-        _track(proc)
         try:
             stdout, stderr = proc.communicate(timeout=self.timeout)
             returncode = proc.returncode
@@ -335,14 +343,16 @@ class OpenJMLRunnerPersistent:
                 "--nonnull-by-default", "--arithmetic-failure=quiet", "-nowarn", path]
 
     def decide(self, accept_src: str, refute_src: str, class_name: str,
-               label: str) -> tuple[str, dict]:
+               label: str, wait_both: bool = False) -> tuple[str, dict]:
         """
         Run the accept and refute stubs concurrently. Returns (decision, info):
           "accept"  - the accept stub verified (the spec provably holds)
           "reject"  - the refute stub verified (the spec provably fails)
           "unknown" - neither verified within the timeout
-          "error"   - both stubs failed to compile / the tool failed
-        Each stub's OpenJML output is kept next to it (openjml.out).
+          "error"   - both stubs failed to compile / the tool failed, or (wait_both) both verified
+        wait_both (vacuity guard, used when the spec's helper methods carry JML contracts, which could be
+        contradictory): do not stop at the first proof; wait for the other side (same timeout) and report
+        "error" (vacuous) if it verifies too. Each stub's OpenJML output is kept next to it (openjml.out).
         """
         import time
         base = os.path.join(self.output_dir, re.sub(r"[^\w\-]", "_", label))
@@ -356,9 +366,11 @@ class OpenJMLRunnerPersistent:
                 with open(path, "w") as fh:
                     fh.write(src)
                 out = open(os.path.join(d, "openjml.out"), "w")
-                p = subprocess.Popen(self._cmd(path), stdout=out, stderr=subprocess.STDOUT,
-                                     text=True, preexec_fn=os.setsid)
-                _track(p)
+                try:
+                    p = _launch(self._cmd(path), stdout=out, stderr=subprocess.STDOUT, text=True)
+                except Exception:
+                    out.close()
+                    raise
                 procs[side] = (p, out, os.path.join(d, "openjml.out"))
         except Exception:                         # launch failed: stop what started, free the slots
             for p, out, _ in procs.values():
@@ -366,23 +378,30 @@ class OpenJMLRunnerPersistent:
                 out.close()
             JVM_SLOTS.release(2)
             raise
-        start, verdicts = time.time(), {}
+        start, verdicts = time.monotonic(), {}
         try:
-            while len(verdicts) < 2 and time.time() - start < self.timeout:
+            while len(verdicts) < 2 and time.monotonic() - start < self.timeout:
                 for side, (p, out, opath) in procs.items():
                     if side in verdicts or p.poll() is None:
                         continue
+                    _kill_group(p)                # the side has ended: stop any solver it left behind
                     out.close()
                     with open(opath, errors="ignore") as fh:
                         verdicts[side] = self._parse(p.returncode, fh.read())
-                    if verdicts[side] == VerifyResult.OK:
+                    if verdicts[side] == VerifyResult.OK and not wait_both:
                         return ("accept" if side == "accept" else "reject"), \
                                {"verdicts": {k: v.value for k, v in verdicts.items()},
-                                "seconds": round(time.time() - start, 2)}
+                                "seconds": round(time.monotonic() - start, 2)}
                 time.sleep(0.2)
             info = {"verdicts": {k: v.value for k, v in verdicts.items()},
-                    "seconds": round(time.time() - start, 2),
+                    "seconds": round(time.monotonic() - start, 2),
                     "timed_out": [s for s in procs if s not in verdicts]}
+            ok = [side for side, v in verdicts.items() if v == VerifyResult.OK]
+            if len(ok) == 2:
+                return "error", {**info, "vacuous": True}      # both provable: contradictory context
+            if len(ok) == 1:
+                info["wait_both"] = True
+                return ("accept" if ok[0] == "accept" else "reject"), info
             if len(verdicts) == 2 and all(v == VerifyResult.ERROR for v in verdicts.values()):
                 return "error", info
             return "unknown", info
@@ -546,14 +565,24 @@ def _evaluate_one_pair_dual(
     """
     result = PairResult(pair_idx=pair_idx)
     guard = harness_cfg.POST_STUB_MODE != "strip"
+    vacuity_guard = helpers_have_contracts(spec)
+
+    def failed(e):
+        # a check that raised (stub construction / rendering): an ERROR verdict with the exception,
+        # excluded from the denominator and counted, never a silently dropped check (or pair)
+        print(f"CHECK ERROR [{task_id}] {pair.label}: {type(e).__name__}: {e}", file=sys.stderr)
+        return "error", {"exception": f"{type(e).__name__}: {e}"}, ""
 
     def post_check(output, lbl):
-        stubs = builder.dual_post_stubs(parsed, spec, pair.inputs, output,
-                                        mutated_arg=mutated_arg, guard_single_case=guard)
-        if stubs is None:
-            return None, {}, ""
-        decision, info = runner.decide(stubs[0], stubs[1], cname, lbl)
-        return decision, info, stubs[0]
+        try:
+            stubs = builder.dual_post_stubs(parsed, spec, pair.inputs, output,
+                                            mutated_arg=mutated_arg, guard_single_case=guard)
+            if stubs is None:
+                return None, {}, ""
+            decision, info = runner.decide(stubs[0], stubs[1], cname, lbl, wait_both=vacuity_guard)
+            return decision, info, stubs[0]
+        except Exception as e:
+            return failed(e)
 
     if spec.postcondition is not None:         # always true here: D13 returns earlier without ensures
         # PostCorrectness: the spec must accept the true output
@@ -565,8 +594,14 @@ def _evaluate_one_pair_dual(
             _log(verbose, task_id, "PostCorrectness", pair.label, VerifyResult.OK if d == "accept"
                  else VerifyResult.FAIL, d == "accept")
         # PostCompleteness: the spec must reject every mutated output
-        mutants = (mutator.mutate_same_length(pair.output, out_type.base) if mutated_arg is not None
-                   else mutator.mutate(out_type, pair.output))
+        try:
+            mutants = (mutator.mutate_same_length(pair.output, out_type.base) if mutated_arg is not None
+                       else mutator.mutate(out_type, pair.output))
+        except Exception as e:
+            d, info, stub = failed(e)
+            result.post_complete_details.append({"label": pair.label, "mutant": "", "verdict": d,
+                                                 "decision_info": info, "killed": None, "stub": stub})
+            mutants = []
         for mut in mutants:
             d, info, stub = post_check(mut, f"post_complete_{pair.label}_{str(mut)[:20]}")
             if d is None:
@@ -579,14 +614,23 @@ def _evaluate_one_pair_dual(
     policy = harness_cfg.MISSING_REQUIRES_POLICY
     if not spec.has_requires and policy == "zero":
         return result
-    psi = builder.effective_pre(parsed, spec, implicit_nonnull=(policy == "jml"))
+    try:
+        psi = builder.effective_pre(parsed, spec, implicit_nonnull=(policy == "jml"))
+        psi_error = None
+    except Exception as e:
+        psi, psi_error = None, e
 
     def pre_check(case, lbl):
+        if psi_error is not None:
+            return failed(psi_error)
         if psi is None:                      # precondition is `true`: admitted, no proof needed
             return "accept", {"trivial": True}, ""
-        a, r = builder.dual_pre_stubs(parsed, spec, case.inputs, psi)
-        d, info = runner.decide(a, r, cname, lbl)
-        return d, info, a
+        try:
+            a, r = builder.dual_pre_stubs(parsed, spec, case.inputs, psi)
+            d, info = runner.decide(a, r, cname, lbl, wait_both=vacuity_guard)
+            return d, info, a
+        except Exception as e:
+            return failed(e)
 
     d, info, stub = pre_check(valid_input_case, f"pre_correct_{valid_input_case.label}")
     result.pre_correct_detail = {
@@ -598,6 +642,22 @@ def _evaluate_one_pair_dual(
             "label": case.label, "verdict": d, "decision_info": info,
             "rejected": True if d == "reject" else False if d == "accept" else None, "stub": stub})
     return result
+
+
+_CONTRACT_WORDS = re.compile(r"\b(requires|ensures|pre|post|axiom|invariant|represents|signals|constraint|"
+                             r"initially)(_redundantly)?\b")
+
+
+def helpers_have_contracts(spec: MethodSpec) -> bool:
+    """True if the helper members copied into the stubs carry JML contracts of their own. Contradictory
+    helper contracts make both the accept and the refute stub provable, so decisions then wait for both
+    sides (decide(wait_both=True)) and report such a check as an error."""
+    src = spec.helpers or ""
+    for s_, e_, kind in java_comments(src):
+        body = src[s_ + 2:e_]
+        if body.startswith("@") and _CONTRACT_WORDS.search(body):
+            return True
+    return False
 
 
 def _should_run_pre(spec: MethodSpec) -> bool:
@@ -758,6 +818,7 @@ def evaluate_problem(
 
     # detect input format from Test.java
     read_ops = detect_input_format(test_src, bench_params)
+    out_layout = detect_output_layout(test_src)          # how Test.java prints the result
 
     # parse io_pairs into TestPair / InputCase objects
     test_pairs: list[TestPair] = []
@@ -766,12 +827,10 @@ def evaluate_problem(
     for idx, pair in enumerate(io_pairs):
         try:
             inputs_bench = parse_input(pair["input"], read_ops)
-            output = parse_output(pair["output"], out_type)
+            output = parse_output(pair["output"], out_type, out_layout)
             if mutated_bench is not None:
-                # in-place output must have the argument's length; empty outputs
-                # mean the benchmark test did not record the result
-                if not isinstance(output, list) or len(output) != len(inputs_bench.get(mutated_bench) or []) \
-                        or not output:
+                # the in-place output must have the argument's length (an empty array stays empty)
+                if not isinstance(output, list) or len(output) != len(inputs_bench.get(mutated_bench) or []):
                     continue
         except Exception as e:
             if verbose:
@@ -824,6 +883,7 @@ def evaluate_problem(
     # launch one thread per test pair
     n_threads = len(test_pairs)
     pair_results: list[PairResult] = [None] * n_threads  # type: ignore
+    pair_errors: list[str] = []          # pairs whose evaluation raised (should not happen: checks catch)
 
     mutated_arg = None
     if mutated_bench is not None:
@@ -842,6 +902,7 @@ def evaluate_problem(
                 try:
                     pair_results[idx] = fut.result()
                 except Exception as e:
+                    pair_errors.append(f"pair {idx}: {type(e).__name__}: {e}")
                     print(f"ERROR [{task.task_id}] pair {idx}: {e}", file=sys.stderr)
 
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
@@ -940,6 +1001,11 @@ def evaluate_problem(
             "evaluable": v.total > 0,
             "details": v.details,
         }
+    output["pair_errors"] = pair_errors
+    output["pairs_unparsed"] = [i for i in range(len(io_pairs)) if f"case_{i}" not in
+                                {tp.label for tp in test_pairs}]
+    output["check_exceptions"] = sum(1 for det in (pc_details, pcl_details, prc_details, prl_details)
+                                     for d in det if (d.get("decision_info") or {}).get("exception"))
     output["not_evaluable"] = [k for k, v in results.items() if v.total == 0]
     output["post_all_unknown"] = (results["post_correctness"].total == 0
                                   and results["post_correctness"].unknowns > 0)

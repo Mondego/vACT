@@ -3609,40 +3609,13 @@
      "generator:max:n",
      "t4_search:exception"
     ]
-   },
-   {
-    "inputs": {
-     "n": 2147483646
-    },
-    "exception": "java.lang.OutOfMemoryError",
-    "sources": [
-     "t4_search:exception"
-    ]
-   },
-   {
-    "inputs": {
-     "n": 296046436
-    },
-    "exception": "java.lang.OutOfMemoryError",
-    "sources": [
-     "t4_search:exception"
-    ]
-   },
-   {
-    "inputs": {
-     "n": 195132961
-    },
-    "exception": "java.lang.OutOfMemoryError",
-    "sources": [
-     "t4_search:exception"
-    ]
    }
   ],
   "v2": {
    "suite": "v2",
    "pool_size": 170,
-   "t_minus_validated": 19,
-   "t_minus_classes": 2,
+   "t_minus_validated": 1,
+   "t_minus_classes": 1,
    "t_minus_per_class": 3,
    "t_minus_split": true,
    "list": "evaluation",
@@ -8769,7 +8742,7 @@
   ],
   "v2": {
    "suite": "v2",
-   "pool_size": 115,
+   "pool_size": 113,
    "t_minus_validated": 348,
    "t_minus_classes": 14,
    "t_minus_per_class": 3,
@@ -9640,7 +9613,7 @@
   ],
   "v2": {
    "suite": "v2",
-   "pool_size": 133,
+   "pool_size": 121,
    "t_minus_validated": 346,
    "t_minus_classes": 12,
    "t_minus_per_class": 3,
@@ -12206,17 +12179,7 @@
    },
    {
     "inputs": {
-     "n": 2147483647
-    },
-    "exception": "java.lang.OutOfMemoryError",
-    "sources": [
-     "generator:max:n",
-     "t4_search:exception"
-    ]
-   },
-   {
-    "inputs": {
-     "n": 2147483646
+     "n": 322417936
     },
     "exception": "java.lang.OutOfMemoryError",
     "sources": [
@@ -12237,15 +12200,6 @@
      "n": -37
     },
     "exception": "java.lang.NegativeArraySizeException",
-    "sources": [
-     "t4_search:exception"
-    ]
-   },
-   {
-    "inputs": {
-     "n": 2147483645
-    },
-    "exception": "java.lang.OutOfMemoryError",
     "sources": [
      "t4_search:exception"
     ]
@@ -12281,8 +12235,8 @@
   "v2": {
    "suite": "v2",
    "pool_size": 100,
-   "t_minus_validated": 261,
-   "t_minus_classes": 7,
+   "t_minus_validated": 257,
+   "t_minus_classes": 6,
    "t_minus_per_class": 3,
    "t_minus_split": true,
    "list": "evaluation",

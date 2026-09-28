@@ -9,7 +9,11 @@ their JSON stdout:
     harness  score the spec on the four spec-harness metrics
     submit   record the final submission (task_complete)
 
-No attempt budget here: the agent's loop is bounded by --max-steps instead.
+The attempt budget (10 verify + run_spec_harness calls) is enforced by the agent
+(cli_agent.CLIAgent), which runs one CLI process per call. Only the JSON result is
+printed on stdout (the scorer's progress output goes to stderr). On SIGTERM / SIGINT /
+SIGHUP (the agent's tool timeout) every OpenJML process group this process started is
+killed before it exits.
 """
 
 from __future__ import annotations
@@ -21,12 +25,18 @@ import sys
 
 # Import the scorer/verifier whether run as `-m veriact.tools.cli` or by file path.
 try:
-    from veriact.tools.harness_tool import Task, evaluate_problem
+    from veriact.tools.harness_tool import Task, evaluate_problem, install_stop_handlers
     from veriact.tools.verifier_tool import VerificationResult, verify_with_openjml
+    from veriact.tools.verifier_tool import kill_live_groups as kill_verifier_groups
 except ImportError:  # invoked directly by path (the agent does this)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from harness_tool import Task, evaluate_problem  # type: ignore
+    from harness_tool import Task, evaluate_problem, install_stop_handlers  # type: ignore
     from verifier_tool import VerificationResult, verify_with_openjml  # type: ignore
+    from verifier_tool import kill_live_groups as kill_verifier_groups  # type: ignore
+
+# run_spec_harness scores the task's first 5 feedback pairs (plus all its invalid inputs), as the
+# Claude Code / Codex tools do (veriact.core.data_types.HARNESS_FEEDBACK_PAIRS; the agent passes it).
+HARNESS_FEEDBACK_PAIRS = 5
 
 # Repair hints — same mapping VeriAct's analyze tool uses.
 REPAIR_HINTS: dict[str, str] = {
@@ -219,7 +229,8 @@ def build_parser() -> argparse.ArgumentParser:
     ph.add_argument("--task-json", dest="task_json", required=True)
     ph.add_argument("--openjml")
     ph.add_argument("--output-dir", dest="output_dir")
-    ph.add_argument("--max-pairs", type=int, default=10, dest="max_pairs")
+    ph.add_argument("--max-pairs", type=int, default=HARNESS_FEEDBACK_PAIRS, dest="max_pairs",
+                    help="feedback pairs to score (default: %(default)s)")
     ph.add_argument("--run-id", dest="run_id")
     ph.set_defaults(func=cmd_harness)
 
@@ -246,6 +257,16 @@ def main(argv: list[str] | None = None) -> int:
         **(_code_snapshot(args.code) if getattr(args, "code", None) else {}),
     }
     rc, err = None, None
+
+    def _log_stopped():  # the stop handler exits at once (os._exit): log the killed call first
+        _log_tool_call(os.path.join(workspace, "harness", "tool_calls.jsonl"), {
+            **rec, "ts_end": datetime.datetime.now().isoformat(timespec="milliseconds"),
+            "duration_s": round(time.time() - start, 3), "exit_code": None,
+            "error": "stopped by signal (tool timeout)", "output": None})
+
+    # On SIGTERM/SIGINT/SIGHUP (the agent's tool timeout) kill every live OpenJML group (the scorer's and
+    # the verifier's: each runs in its own session, so killing this process's group does not reach them).
+    install_stop_handlers(kill_verifier_groups, _log_stopped)
     try:
         rc = args.func(args)
         return rc

@@ -42,6 +42,7 @@ python runners/rq3_run.py status --out /data/rq3_out
 - **Harness settings:** 10 evaluation pairs plus the evaluation T−, dual accept/refute decisions, 300 s per decision, `exclude_collection_tasks=False`.
 - **Parallelism:** `--jvm-slots` caps the concurrent OpenJML JVMs (2 per decision), and every timer starts at launch.
 - **No postcondition (D13):** a spec without an `ensures` clause on the method scores 0 on all four metrics without running OpenJML (`no_postcondition=True`, kept in the denominators).
+- **Duplicate reuse (default):** byte-identical specs on the same task are scored once, and the others get a copy of the result (`reused_from`), so every spec keeps its own row. `--shard` splits by duplicate group. `--no-reuse` scores every spec itself.
 - **Stopping:** Ctrl-C, `kill <pid>` or closing the screen stops the runner **and** every OpenJML/cvc4 process it started. A task interrupted mid-way is not saved.
 - **Resumable:** re-run the same command after any interruption; finished units are skipped.
 - **Splitting:** `--shard i/n` splits the work over several machines or sessions; `--bench sgb` / `--bench fb` works too. Two machines: `--shard 0/2` on one and `--shard 1/2` on the other, each with its own `--out`; `collect.py` merges them.
@@ -83,7 +84,11 @@ python runners/collect.py rq4 --in results_raw/rq4_m2 results_raw/rq4_m3 --out r
 - **RQ3:** `rq3_per_spec.csv`, `rq3_fig4_cells.csv` (per benchmark × model × {SG, AS, FB} × metric × τ), `rq3_by_config.csv`, and `rq3_collect_report.json` (completeness, statuses, bundle hashes).
 - **RQ4:** `rq4_per_task.csv`, `rq4_summary.csv`, `rq4_collect_report.json`.
 
-**Scoring conventions:**
-- An integrity failure makes every metric 0 (still evaluable).
-- A metric with no decided check (an empty T−, or all-unknown post checks) is left out of that metric's denominator and counted.
-- Post-Harness@τ = PostCorr ≥ τ and PostComp ≥ τ over all tasks (unverified = 0). Tasks whose post checks are all unknown are left out of it and counted.
+**Scoring conventions** (D13, D14; identical in RQ3 and RQ4):
+- **Failures score 0 on every metric and stay in every denominator:** an integrity failure (class, signature, method body or any other class member changed, or code that cannot be parsed), and a spec without `ensures` (no postcondition).
+- **Fixed denominators:** every fraction ≥ τ is (specs meeting τ) / (tasks × prompt configurations), whatever a run produced. RQ3: SGB 120 and FB 662 tasks; RQ4: 120 per benchmark. Not verified, no postcondition, integrity failure and undecided (unknown) checks all count as not meeting τ, and their counts are reported next to each cell.
+- **PreComp** is measured over the tasks whose evaluation suite has invalid inputs (SGB, FB and FB-120 counts in `rq3_collect_report.json` / `rq4_summary.csv`).
+- **Means** are over evaluable specs and are descriptive only.
+- **Post-Harness@τ** = PostCorr ≥ τ and PostComp ≥ τ, over all tasks.
+
+**Completeness:** `collect.py` exits with code 4 (after writing its report) when units are missing or failed. Finish the runs (`rq3_run.py run --retry-errors`, `rq4_run.py score --retry-errors`) or pass `--allow-incomplete` for preliminary numbers. RQ3 needs `--rq1-dir` pointing at the 136 RQ1 files (`inputs/rq1` inside the bundle, `artifacts/rq1` on the reference machine). Results scored with different `--pairs` must be collected with `--pairs <smallest>`.

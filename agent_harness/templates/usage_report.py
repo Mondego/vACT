@@ -14,7 +14,8 @@ Sources, per task (whatever exists):
                        or old Codex text logs ("tokens used" total only)
   codex_rollout.jsonl  Codex session rollout (cumulative token_count events)
   llm_calls.jsonl      VeriAct per-call usage
-  tool_calls.jsonl     verify / harness / submit calls (offline scoring excluded)
+  tool_calls.jsonl     verify / harness / submit calls (field `tool`, older logs: `command`;
+                       `status` ok / code_modified / budget_exhausted / killed / error)
   .attempts            calls charged to the budget (Claude Code / Codex)
 
 Usage:
@@ -156,7 +157,7 @@ def agent_tool_uses(agent, task_harness):
     elif agent == "veriact":
         for ev in _jsonl(os.path.join(task_harness, "tool_calls.jsonl")):
             if not ev.get("offline"):
-                names.append(ev.get("command") or "?")
+                names.append(ev.get("tool") or ev.get("command") or "?")
     if not names:
         return None, ""
     c = {}
@@ -166,15 +167,22 @@ def agent_tool_uses(agent, task_harness):
 
 
 def tool_counts(task_harness):
-    c = {"verify_calls": 0, "harness_calls": 0, "submit_calls": 0, "tool_time_s": 0.0}
+    c = {"verify_calls": 0, "harness_calls": 0, "submit_calls": 0, "accepted_calls": 0,
+         "code_modified_calls": 0, "budget_exhausted_calls": 0, "killed_calls": 0, "tool_time_s": 0.0}
     found = False
     for ev in _jsonl(os.path.join(task_harness, "tool_calls.jsonl")):
         if ev.get("offline"):
             continue
         found = True
-        key = {"verify": "verify_calls", "harness": "harness_calls", "submit": "submit_calls"}.get(ev.get("command"))
+        tool = ev.get("tool") or ev.get("command")
+        key = {"verify": "verify_calls", "harness": "harness_calls", "submit": "submit_calls"}.get(tool)
         if key:
             c[key] += 1
+        if ev.get("accepted") is True:
+            c["accepted_calls"] += 1
+        st = ev.get("status") or ((ev.get("output") or {}).get("error") == "code_modified" and "code_modified")
+        if st in ("code_modified", "budget_exhausted", "killed"):
+            c[f"{st}_calls"] += 1
         c["tool_time_s"] += ev.get("duration_s") or 0
     c["tool_time_s"] = round(c["tool_time_s"], 3)
     return c if found else {}
@@ -210,6 +218,7 @@ def row_for(task_id, tdir):
         **tool_counts(h), "attempts_charged": attempts if attempts is not None else meta.get("attempts_used"),
         **dict(zip(("agent_tool_uses", "agent_tool_uses_by_name"), agent_tool_uses(agent, h))),
         "integrity_blocks": meta.get("integrity_blocks"),
+        "attempt": meta.get("attempt"), "interrupted": meta.get("interrupted"),
         "submitted": os.path.exists(os.path.join(tdir, "submission.json")),
         "usage_source": usage.get("usage_source"),
         "has_run_meta": bool(meta),
@@ -241,7 +250,8 @@ def main():
 
     summary = {"root": a.root, "tasks": len(rows), "agents": sorted({str(r["agent"]) for r in rows}),
                **{k: stats(k) for k in ["wall_s", *TOKEN_KEYS, "cost_usd", "llm_turns", "agent_tool_uses", "verify_calls",
-                                        "harness_calls", "attempts_charged", "tool_time_s", "integrity_blocks"]},
+                                        "harness_calls", "accepted_calls", "code_modified_calls",
+                                        "attempts_charged", "tool_time_s", "integrity_blocks"]},
                "timed_out": sum(1 for r in rows if r.get("timed_out")),
                "usage_sources": {s: sum(1 for r in rows if str(r.get("usage_source")) == s)
                                  for s in sorted({str(r.get("usage_source")) for r in rows})}}

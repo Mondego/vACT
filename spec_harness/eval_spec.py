@@ -10,6 +10,9 @@ from spec_harness.harness import (
     MethodSpec,
     InputCase,
     JType,
+    java_comments,
+    mask_comments_and_literals,
+    strip_jml_inner_comments,
 )
 
 # JML extraction from LLM-generated Java source
@@ -54,72 +57,89 @@ def _find_method_line(source: str, method_name: str | None = None) -> int | None
 
 def extract_jml_spec(source: str, method_name: str | None = None) -> MethodSpec:
     """
-    Extract the raw JML comment block from above the method declaration.
+    Extract the method's JML specification.
 
-    Uses ``javalang`` to locate the method, then walks backwards to
-    collect contiguous JML comment lines (``//@`` or ``/*@ … @*/``).
-    The block is returned as-is in a ``MethodSpec``, preserving the
-    exact LLM-generated annotations.
+    The specification is every JML annotation comment between the end of the previous class member (or
+    the class's `{`) and the method's name: `//@ ..` line annotations and `/*@ .. @*/` block annotations,
+    whatever blank lines, Java annotations or ordinary comments lie in between. Ordinary comments (`//`,
+    `/* */`, Javadoc `/** */`, including a Javadoc `@requires` tag) are not JML and are ignored, as
+    OpenJML ignores them; comments nested inside a JML annotation (`//@ requires x > 0; // note`) are
+    removed. The result is returned as normalized `//@ ..` lines (one per annotation line) in a
+    ``MethodSpec``; `helpers` is the source of all other class members (the JML region and the method
+    excluded).
     """
     lines = source.splitlines()
-    method_line = _find_method_line(source, method_name)
-
-    if method_line is not None:
-        # Walk backwards from the line before the method declaration.
-        # Skip blank lines and Java annotations (@Override etc.) first,
-        # but stop at JML block comment endings (@*/ or */).
-        end = method_line - 2  # 0-based index of the line before method
-        while end >= 0:
-            s = lines[end].strip()
-            # Stop at JML-related lines
-            if (
-                s.startswith("//@")
-                or s.startswith("/*@")
-                or s.endswith("@*/")
-                or s.endswith("*/")
-            ):
-                break
-            # Skip blank lines and Java annotations (@Override, etc.)
-            if not s or s.startswith("@"):
-                end -= 1
-            else:
-                break
-
-        # Now walk backwards collecting the JML block.
-        start = end
-        in_block_comment = False
-        while start >= 0:
-            s = lines[start].strip()
-            if s.endswith("@*/") or s.endswith("*/"):
-                in_block_comment = True
-            if in_block_comment:
-                if s.startswith("/*@") or s.startswith("/*"):
-                    in_block_comment = False
-                start -= 1
-                continue
-            if s.startswith("//@"):
-                start -= 1
-                continue
-            break
-        jml_block = "\n".join(lines[start + 1 : end + 1])
-    else:
-        # Fallback: collect all //@ lines from the source
-        jml_lines = [
-            l
-            for l in lines
-            if l.strip().startswith("//@") or l.strip().startswith("/*@")
-        ]
-        jml_block = "\n".join(jml_lines)
-
+    region = _jml_region(source, method_name)
+    if region is not None:
+        r_start, r_end, body_open, meth_close, body_close = region
+        anns = [(s, e, k) for s, e, k in java_comments(source) if r_start <= s < r_end]
+    else:                                           # method not found: every JML annotation of the file
+        anns = java_comments(source)
+    jml_block = "\n".join(_jml_lines(source, anns))
     helpers = ""
-    if method_line is not None:
-        try:
-            helpers = _other_members(lines, start + 1, method_line - 1)
-        except Exception:
-            helpers = ""
+    if region is not None:
+        members = (source[body_open + 1: r_start] + "\n" + source[meth_close + 1: body_close]).strip("\n")
+        helpers = members if members.strip() else ""
     imports = "\n".join(l.strip() for l in lines
                         if re.match(r"^\s*import\s+(static\s+)?[\w.]+(\.\*)?\s*;", l))
     return MethodSpec(jml_block=jml_block, helpers=helpers, imports=imports)
+
+
+def _jml_lines(source: str, comments) -> list[str]:
+    """Normalized `//@ ..` lines of the JML annotations among `comments` (ordinary comments skipped)."""
+    out = []
+    for s, e, kind in comments:
+        if kind == "line":
+            content = source[s + 2:e]
+            if not content.startswith("@"):
+                continue                               # `// ..`: an ordinary comment
+            inner = [content.lstrip("@")]
+        else:
+            content = source[s + 2:e - 2] if source[s:e].endswith("*/") else source[s + 2:e]
+            if not content.startswith("@"):
+                continue                               # `/* ..*/` or Javadoc `/** ..*/`
+            inner = content.lstrip("@").rstrip("@").splitlines()
+        for line in strip_jml_inner_comments("\n".join(inner)).splitlines():
+            line = re.sub(r"^\s*@+", "", line).strip()
+            if line:
+                out.append("//@ " + line)
+    return out
+
+
+def _jml_region(source: str, method_name: str | None):
+    """
+    Offsets for the target method: (region start, region end, class-body `{`, method-body `}`,
+    class-body `}`). The region runs from just after the previous member (the last `;`, `{` or `}` of code
+    before the method) to the method's name; comments and literals are ignored when looking for code.
+    None if the method or its class cannot be located.
+    """
+    line = _find_method_line(source, method_name)
+    if line is None:
+        return None
+    code = mask_comments_and_literals(source)
+    offs = [0]
+    for l in source.splitlines(keepends=True):
+        offs.append(offs[-1] + len(l))
+    if line - 1 >= len(offs):
+        return None
+    name = method_name or "solve"
+    m = re.compile(r"\b" + re.escape(name) + r"\s*\(").search(code, offs[line - 1])
+    if not m:
+        m = re.compile(r"\b\w+\s*\(").search(code, offs[line - 1])
+        if not m:
+            return None
+    name_at = m.start()
+    prev = max(code.rfind(ch, 0, name_at) for ch in ";{}")
+    classes = list(re.finditer(r"\bclass\s+\w+", code[:name_at]))
+    if prev < 0 or not classes:
+        return None
+    body_open = _first_code_brace(code, classes[-1].end())
+    body_close = _match_brace(code, body_open) if body_open >= 0 else -1
+    meth_open = _first_code_brace(code, m.end())
+    meth_close = _match_brace(code, meth_open) if meth_open >= 0 else -1
+    if min(body_open, body_close, meth_open, meth_close) < 0:
+        return None
+    return prev + 1, name_at, body_open, meth_close, body_close
 
 
 def _match_brace(text: str, open_idx: int) -> int:
@@ -213,6 +233,8 @@ class ReadOp:
     # array_2d | array_2d_rc |
     # map | set | list_direct
     group_idx: int = -1  # index within the grouped-scalars line
+    # array_2d_rc: whether Test.java reads the r row lines when c == 0 (FB: always; SGB: only if c > 0)
+    rows_when_no_cols: bool = True
 
 
 # javalang AST helpers for Test.java analysis
@@ -539,6 +561,9 @@ def detect_input_format(test_src: str, params: list[dict]) -> list[ReadOp]:
             if len(ordered_params) != len(params):
                 ordered_params = list(params)  # fallback
 
+    # SGB tests read the rows of an r x c matrix in `for (i < r && c > 0)`: no row lines when c == 0
+    rows_when_no_cols = not re.search(r"<\s*\w+\s*&&\s*\w+\s*>\s*0", test_src or "")
+
     # --- build ReadOps in input order -------------------------------------
     for pi, p in enumerate(ordered_params):
         jtype = p["jtype"]
@@ -560,7 +585,7 @@ def detect_input_format(test_src: str, params: list[dict]) -> list[ReadOp]:
             # Nested list (e.g. List<List<Integer>>) → 2D-style input
             if jtype.generic_args and _is_nested_collection(jtype.generic_args[0]):
                 mode = "array_2d_rc" if has_2d_rc else "array_2d"
-                ops.append(ReadOp(name, jtype, mode))
+                ops.append(ReadOp(name, jtype, mode, rows_when_no_cols=rows_when_no_cols))
             else:
                 ops.append(ReadOp(name, jtype, "list_direct"))
             continue
@@ -568,7 +593,7 @@ def detect_input_format(test_src: str, params: list[dict]) -> list[ReadOp]:
         # --- 2-D+ array ---
         if jtype.is_array and jtype.array_dims >= 2:
             mode = "array_2d_rc" if has_2d_rc else "array_2d"
-            ops.append(ReadOp(name, jtype, mode))
+            ops.append(ReadOp(name, jtype, mode, rows_when_no_cols=rows_when_no_cols))
             continue
 
         # --- char[] read as one line (Test.java: line.toCharArray()) ---
@@ -601,8 +626,16 @@ def detect_input_format(test_src: str, params: list[dict]) -> list[ReadOp]:
 # Scalar value parser
 
 
-def _parse_scalar(type_name: str, s: str) -> Any:
-    """Convert a string token to a typed Python value."""
+def _java_split(line: str) -> list[str]:
+    """Java's `line.trim().split("\\s+")`: an empty (or blank) line gives [""], not []."""
+    t = line.strip()
+    return t.split() if t else [""]
+
+
+def _parse_scalar(type_name: str, s: str, raw: bool = False) -> Any:
+    """Convert a string token to a typed Python value (raw: a String token is kept exactly)."""
+    if raw and type_name == "String":
+        return s
     s = s.strip()
     if type_name in ("int", "Integer", "short", "Short", "byte", "Byte"):
         return int(s)
@@ -683,8 +716,9 @@ def parse_input(input_str: str, ops: list[ReadOp]) -> dict[str, Any]:
 
         # ---- 1-D array, no size prefix ------------------------------------
         elif op.mode == "array_direct":
-            parts = lines[pos].strip().split()
-            result[op.name] = [_parse_scalar(op.jtype.base, p) for p in parts]
+            parts = _java_split(lines[pos])
+            result[op.name] = [_parse_scalar(op.jtype.base, p, raw=True) for p in parts] \
+                if op.jtype.base == "String" else [_parse_scalar(op.jtype.base, p) for p in parts if p]
             pos += 1
 
         # ---- 1-D array, size on previous line -----------------------------
@@ -698,19 +732,16 @@ def parse_input(input_str: str, ops: list[ReadOp]) -> dict[str, Any]:
             else:
                 result[op.name] = []
 
-        # ---- 2-D array (formal): n_rows then rows -------------------------
+        # ---- 2-D array (formal): n_rows then rows (every row line is consumed) -------------------
         elif op.mode == "array_2d":
             elem = _leaf_element_type(op.jtype)
             n_rows = int(lines[pos].strip())
             pos += 1
             mat = []
             for _ in range(n_rows):
-                if pos < len(lines) and lines[pos].strip():
-                    row = [_parse_scalar(elem, x) for x in lines[pos].strip().split()]
-                    mat.append(row)
-                    pos += 1
-                else:
-                    mat.append([])
+                line = lines[pos] if pos < len(lines) else ""
+                pos += 1
+                mat.append([_parse_scalar(elem, x) for x in line.strip().split()])
             result[op.name] = mat
 
         # ---- 2-D array (specbench): rows cols then rows --------------------
@@ -721,18 +752,16 @@ def parse_input(input_str: str, ops: list[ReadOp]) -> dict[str, Any]:
             pos += 1
             mat = []
             if n_cols == 0:
-                # Empty-column matrix: no row data lines to read
+                # r empty rows; the FB tests still read (and ignore) r row lines, the SGB tests read none
                 mat = [[] for _ in range(n_rows)]
+                if op.rows_when_no_cols:
+                    pos += n_rows
             else:
                 for _ in range(n_rows):
-                    if pos < len(lines):
-                        row = [
-                            _parse_scalar(elem, x) for x in lines[pos].strip().split()
-                        ]
-                        mat.append(row)
-                        pos += 1
-                    else:
-                        mat.append([])
+                    line = lines[pos] if pos < len(lines) else ""
+                    pos += 1
+                    # Test.java reads exactly c tokens of each row line (extra tokens are ignored)
+                    mat.append([_parse_scalar(elem, x) for x in line.strip().split()[:n_cols]])
             result[op.name] = mat
 
         # ---- HashMap -------------------------------------------------------
@@ -766,12 +795,11 @@ def parse_input(input_str: str, ops: list[ReadOp]) -> dict[str, Any]:
         # ---- List / ArrayList / LinkedList (space-separated, no size) -----
         elif op.mode == "list_direct":
             etype = op.jtype.generic_args[0] if op.jtype.generic_args else "Integer"
-            line = lines[pos].strip()
-            if line:
-                parts = line.split()
-                result[op.name] = [_parse_scalar(etype, p) for p in parts]
+            if etype == "String":                    # Java: line.trim().split("\\s+") ("" -> [""])
+                result[op.name] = [_parse_scalar(etype, p, raw=True) for p in _java_split(lines[pos])]
             else:
-                result[op.name] = []
+                line = lines[pos].strip()
+                result[op.name] = [_parse_scalar(etype, p) for p in line.split()] if line else []
             pos += 1
 
         i += 1
@@ -782,12 +810,37 @@ def parse_input(input_str: str, ops: list[ReadOp]) -> dict[str, Any]:
 # Output string → typed Python value
 
 
-def parse_output(output_str: str, return_type: JType) -> Any:
+def detect_output_layout(test_src: str) -> dict:
     """
-    Parse a competitive-programming-style output string into a typed
-    Python value, guided by the method's return type.
+    How Test.java prints the result, from its source: `header` = the first print after the call prints
+    only the result's size (`result.length`, `result.size()`, `r + " " + c` with r/c taken from the
+    result) before the rows / elements; `sep` = the row's String.join separator if not blank (e.g. ", "), else " ".
     """
-    output_str = output_str.rstrip("\n")
+    src = test_src or ""
+    i = src.find("Solution.solve(")
+    tail = src[src.find(";", i) + 1:] if i >= 0 else ""
+    prints = re.findall(r"System\.out\.print(?:ln)?\s*\((.*?)\);", tail, re.S)
+    header = False
+    if len(prints) >= 2:
+        first = prints[0]
+        size_vars = set(re.findall(r"\b(\w+)\s*=\s*[^;,]*?\.(?:length|size\(\))", tail))
+        header = (bool(re.search(r"\.length\b|\.size\(\)", first)) and "stream" not in first
+                  and "join" not in first) or \
+                 (bool(size_vars) and set(re.findall(r"\b[A-Za-z_]\w*\b", first)) <= size_vars)
+    m = re.search(r'String\.join\(\s*"((?:[^"\\]|\\.)*)"', tail)
+    sep = m.group(1) if m and m.group(1).strip() else " "          # e.g. ", " (FB_ListifyList)
+    return {"header": header, "sep": sep}
+
+
+def parse_output(output_str: str, return_type: JType, layout: dict | None = None) -> Any:
+    """
+    Parse the text Test.java printed for the result into a typed Python value, guided by the return type
+    and by the print layout of Test.java (detect_output_layout): a size header line is skipped, rows are
+    split on the row separator, a String result is kept exactly (only the final newline removed) and
+    "null" is a null String. Ambiguous layouts (3-D arrays printed without shape) raise ValueError.
+    """
+    layout = layout or {"header": False, "sep": " "}
+    output_str = output_str[:-1] if output_str.endswith("\n") else output_str
 
     if return_type.base == "void":
         return None
@@ -808,15 +861,34 @@ def parse_output(output_str: str, return_type: JType) -> Any:
             d[_parse_scalar(ktype, parts[0])] = _parse_scalar(vtype, parts[1].strip())
         return d
 
-    # ---- 2-D+ array --------------------------------------------------------
-    if return_type.is_array and return_type.array_dims >= 2:
-        rows = []
-        for line in output_str.split("\n"):
-            line = line.strip()
-            if line:
-                row = [_parse_scalar(return_type.base, x) for x in line.split()]
-                rows.append(row)
-        return rows
+    def split_row(line: str, etype: str) -> list:
+        if layout["sep"].strip():                    # an explicit separator such as "," or ", "
+            return [] if line == "" else [_parse_scalar(etype, x, raw=True) for x in line.split(layout["sep"])]
+        return [_parse_scalar(etype, x) for x in line.split()]
+
+    def rows_of(etype: str) -> list:
+        lines = output_str.split("\n") if output_str != "" else []
+        if layout["header"]:
+            if not lines:
+                raise ValueError("missing size header")
+            n = int(lines[0].split()[0])
+            body = lines[1:]
+            if len(body) < n:
+                body += [""] * (n - len(body))       # empty last rows print as empty lines
+            return [split_row(l, etype) for l in body[:n]]
+        return [split_row(l, etype) for l in lines]
+
+    # ---- 2-D array ---------------------------------------------------------
+    if return_type.is_array and return_type.array_dims >= 3:
+        raise ValueError("3-D array output is printed without its shape: ambiguous")
+    if return_type.is_array and return_type.array_dims == 2:
+        return rows_of(return_type.base)
+
+    # ---- nested list (List<List<T>>) ----------------------------------------
+    if return_type.base in ("List", "ArrayList", "LinkedList") and return_type.generic_args \
+            and _is_nested_collection(return_type.generic_args[0]):
+        inner = re.sub(r"^\w+<\s*|\s*>$", "", return_type.generic_args[0])
+        return rows_of(inner or "Integer")
 
     # ---- char[] (one line of characters) ----------------------------------
     if return_type.is_array and return_type.array_dims == 1 and return_type.base in ("char", "Character"):
@@ -839,6 +911,9 @@ def parse_output(output_str: str, return_type: JType) -> Any:
 
     # ---- Set / HashSet / TreeSet -------------------------------------------
     if return_type.base in ("Set", "HashSet", "TreeSet"):
+        if layout["header"]:
+            lines = output_str.split("\n")
+            output_str = lines[1] if len(lines) > 1 else ""
         tokens = output_str.strip().split()
         etype = return_type.generic_args[0] if return_type.generic_args else "Integer"
         if not tokens or tokens == [""]:
@@ -846,6 +921,8 @@ def parse_output(output_str: str, return_type: JType) -> Any:
         return [_parse_scalar(etype, t) for t in tokens]
 
     # ---- scalar ------------------------------------------------------------
+    if return_type.base == "String":
+        return None if output_str == "null" else output_str   # exactly what println printed
     return _parse_scalar(return_type.base, output_str.strip())
 
 

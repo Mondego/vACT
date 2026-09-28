@@ -188,14 +188,14 @@ def verify_with_openjml(
         tmp_filename,
     ]
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        preexec_fn=os.setsid,
-    )
-    with _LIVE_LOCK:
+    with _LIVE_LOCK:                  # launch and registration are atomic w.r.t. kill_live_groups
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            preexec_fn=os.setsid,
+        )
         _LIVE_GROUPS.add(proc.pid)
 
     try:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify_with_openjml — run OpenJML ESC on Solution.java.
+# verify — run OpenJML ESC on Solution.java (takes no arguments).
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/harness/_env.sh"

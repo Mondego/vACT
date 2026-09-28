@@ -164,6 +164,77 @@ _HEADER_WORDS = {
 }
 
 
+def java_comments(text: str) -> list[tuple[int, int, str]]:
+    """
+    (start, end, kind) of every Java comment, kind "line" (// .. end of line, the newline excluded) or
+    "block" (/* .. */), found by a lexer that skips string, char and text-block literals, so `//` or `/*`
+    inside "..." is not a comment. An unterminated block comment runs to the end of the text.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith('"""', i):                       # text block
+            j = text.find('"""', i + 3)
+            i = n if j < 0 else j + 3
+        elif c in ('"', "'"):
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append((i, j, "line"))
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append((i, j, "block"))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def mask_comments_and_literals(text: str) -> str:
+    """`text` with every comment and string/char literal replaced by spaces (newlines kept), so offsets and
+    line numbers are unchanged and regexes / brace matching see only code."""
+    buf = list(text)
+    for s, e, _ in java_comments(text):
+        for k in range(s, e):
+            if buf[k] != "\n":
+                buf[k] = " "
+    i, n = 0, len(text)
+    comments = {s: e for s, e, _ in java_comments(text)}
+    while i < n:
+        if i in comments:
+            i = comments[i]
+            continue
+        c = text[i]
+        if c in ('"', "'"):
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            for k in range(i + 1, min(j, n)):
+                if buf[k] != "\n":
+                    buf[k] = " "
+            i = j + 1
+        else:
+            i += 1
+    return "".join(buf)
+
+
+def strip_jml_inner_comments(text: str) -> str:
+    """Inside a JML annotation: drop nested `// ..` (to end of line) and `/* .. */` comments that are not
+    inside string/char literals (OpenJML treats them as comments)."""
+    parts, last = [], 0
+    for s, e, _ in java_comments(text):
+        parts.append(text[last:s])
+        last = e
+    parts.append(text[last:])
+    return "".join(parts)
+
+
 def _strip_markers(jml_block: str) -> str:
     """Remove JML comment markers (//@, /*@, @*/, */, leading @) and join lines."""
     text = jml_block
@@ -504,12 +575,15 @@ class JavaMethodParser:
         except javalang.parser.JavaSyntaxError as e:
             raise ValueError(f"javalang parse error: {e}") from e
 
-        methods = [n for _, n in tree if isinstance(n, jtree.MethodDeclaration)]
-        wanted = method_name or ("solve" if any(m.name == "solve" for m in methods) else None)
-        for node in methods:
+        methods = [(p, n) for p, n in tree if isinstance(n, jtree.MethodDeclaration)]
+        wanted = method_name or ("solve" if any(m.name == "solve" for _, m in methods) else None)
+        for path, node in methods:
             if wanted is None or node.name == wanted:
+                # the class that declares the method (from the syntax tree, so the word "class" in a
+                # comment cannot be mistaken for the class name)
+                owners = [x for x in path if isinstance(x, jtree.ClassDeclaration)]
                 return {
-                    "class_name":  class_name,
+                    "class_name":  owners[-1].name if owners else class_name,
                     "method_name": node.name,
                     "return_type": self._jtype(node.return_type),
                     "params": [
@@ -526,7 +600,7 @@ class JavaMethodParser:
     @staticmethod
     def _ensure_class(source: str) -> tuple[str, str]:
         source = source.strip()
-        m = re.search(r'\bclass\s+(\w+)', source)
+        m = re.search(r'\bclass\s+(\w+)', mask_comments_and_literals(source))
         if m:
             return source, m.group(1)
         # Bare method — wrap in a synthetic class
@@ -830,30 +904,36 @@ class StubBuilder:
             return [f"{I}//@ assume {name} != null && {name}.equals({lit});"]
 
         # ---- other scalars ----
-        lit = self._renderer._scalar(jtype.base, value)
-        return [f"{I}//@ assume {name} == {lit};"]
+        return [f"{I}//@ assume {self._scalar_eq(name, jtype.base, value)};"]
+
+    def _scalar_eq(self, expr: str, base: str, value) -> str:
+        """`expr == literal`; a NaN value is pinned with isNaN (`x == Double.NaN` is always false, which
+        would make every stub vacuous)."""
+        if isinstance(value, float) and value != value and base in ("double", "Double", "float", "Float"):
+            return f"{'Float' if base in ('float', 'Float') else 'Double'}.isNaN({expr})"
+        return f"{expr} == {self._renderer._scalar(base, value)}"
 
     def _assume_array(self, name: str, jtype: JType,
                       value: list) -> list[str]:
-        """Element-wise assumes for 1-D / 2-D arrays."""
+        """Element-wise assumes for 1-D / 2-D arrays (a null row of a 2-D array is pinned as null)."""
         I = "        "
         lines = [f"{I}//@ assume {name} != null;",
                  f"{I}//@ assume {name}.length == {len(value)};"]
 
         if jtype.array_dims == 1:
             for i, v in enumerate(value):
-                lit = self._renderer._scalar(jtype.base, v)
-                lines.append(f"{I}//@ assume {name}[{i}] == {lit};")
+                lines.append(f"{I}//@ assume {self._scalar_eq(f'{name}[{i}]', jtype.base, v)};")
         elif jtype.array_dims >= 2:
             elem = jtype.element_type()
             for i, row in enumerate(value):
+                if row is None:
+                    lines.append(f"{I}//@ assume {name}[{i}] == null;")
+                    continue
                 lines.append(f"{I}//@ assume {name}[{i}] != null;")
                 lines.append(f"{I}//@ assume {name}[{i}].length == {len(row)};")
                 if elem.array_dims == 0:
                     for j, v in enumerate(row):
-                        lit = self._renderer._scalar(jtype.base, v)
-                        lines.append(
-                            f"{I}//@ assume {name}[{i}][{j}] == {lit};")
+                        lines.append(f"{I}//@ assume {self._scalar_eq(f'{name}[{i}][{j}]', jtype.base, v)};")
                 # deeper arrays — skip per-element (would need recursion)
         return lines
 
@@ -1195,14 +1275,19 @@ class OutputMutator:
     def __init__(self, k: int = 5):
         self.k = k
 
-    # ---- equality that treats -0.0 == 0.0 and compares nested structures ----
+    # ---- equality that treats -0.0 == 0.0 and NaN == NaN, element-wise in nested structures ----
     @staticmethod
     def _eq(a: Any, b: Any) -> bool:
+        if isinstance(a, list) and isinstance(b, list):
+            return len(a) == len(b) and all(OutputMutator._eq(x, y) for x, y in zip(a, b))
+        if isinstance(a, dict) and isinstance(b, dict):
+            return a.keys() == b.keys() and all(OutputMutator._eq(a[k], b[k]) for k in a)
         if isinstance(a, float) or isinstance(b, float):
             try:
-                return float(a) == float(b)
+                fa, fb = float(a), float(b)
             except (TypeError, ValueError):
                 return a == b
+            return fa == fb or (fa != fa and fb != fb)
         return a == b
 
     _INT_RANGE = {"int": (-2**31, 2**31 - 1), "Integer": (-2**31, 2**31 - 1),
@@ -1246,7 +1331,7 @@ class OutputMutator:
         try:
             if jtype.is_array:
                 return self._mutate_array(list(value) if value is not None else [],
-                                          jtype.base)
+                                          jtype.base, jtype.array_dims)
             if jtype.is_collection:
                 return self._mutate_collection(jtype, value)
             return self._mutate_scalar(jtype.base, value)
@@ -1263,6 +1348,8 @@ class OutputMutator:
             return self._finish([v + 1, v - 1, v + 2, v - 2, 0], v, base, fallbacks=[v - 3, v + 3, 1, -1, v // 2])
         if base in ("double", "float", "Double", "Float"):
             v = float(v)
+            if v != v:                                             # NaN: v + 1 etc. would be NaN again
+                return self._finish([0.0, 1.0, -1.0, float("inf"), float("-inf")], v)
             return self._finish([v + 1.0, v - 1.0, v * 2.0, -v, 0.0], v)
         if base == "String":
             v = "" if v is None else str(v)
@@ -1325,7 +1412,7 @@ class OutputMutator:
               [self._perturb_elem(x, -1) for x in v]]
         return self._finish(cands, v, base, fallbacks=fb)
 
-    def _mutate_array(self, v: list, base: str = "int") -> list:
+    def _mutate_array(self, v: list, base: str = "int", dims: int = 1) -> list:
         cands: list = []
         if v:
             cands.append(v[:-1])                                   # drop last
@@ -1334,6 +1421,8 @@ class OutputMutator:
             cands.append([self._perturb_elem(x) for x in v])       # perturb every element
             if isinstance(last, list) and last:
                 cands.append(v[:-1] + [last[:-1]])                 # 2-D: drop last elem of last row
+        elif dims >= 2:
+            cands.append([[]])                                     # empty 2-D -> one empty row
         else:
             cands.append([self._default_elem(base)])               # empty -> one element
         cands.append([])                                           # empty
@@ -1368,7 +1457,8 @@ def parse_openjml_output(output: str, returncode: Optional[int] = None) -> Verif
     F3: distinguish verification failures from tool/compile errors.
       FAIL    - "N warning(s)" or "N verification failure(s)"
       ERROR   - compile / tool error ("error" present, no verification report)
-      OK      - returncode 0, "verified", "0 warnings", or empty output
+      OK      - returncode 0 (when a returncode is given); without one: "verified", "0 warnings",
+                or empty output
       UNKNOWN - anything else (timeouts are mapped by the caller)
     """
     low = output.strip().lower()
@@ -1378,7 +1468,10 @@ def parse_openjml_output(output: str, returncode: Optional[int] = None) -> Verif
         return VerifyResult.FAIL
     if re.search(r'\berrors?\b', low):
         return VerifyResult.ERROR
-    if returncode == 0 or "verified" in low or "0 warnings" in low or low == "":
+    if returncode is not None:
+        # a run that did not exit normally (killed, crashed) is never a proof, whatever it printed
+        return VerifyResult.OK if returncode == 0 else VerifyResult.UNKNOWN
+    if "verified" in low or "0 warnings" in low or low == "":
         return VerifyResult.OK
     return VerifyResult.UNKNOWN
 
@@ -1408,12 +1501,15 @@ _CMT_BLOCK = re.compile(r'/\*.*?\*/', re.S)
 
 
 def strip_comments(src: str) -> str:
-    """Remove JML annotations and ordinary Java comments."""
-    src = _JML_BLOCK.sub(' ', src)
-    src = _JML_LINE.sub(' ', src)
-    src = _CMT_BLOCK.sub(' ', src)
-    src = _CMT_LINE.sub(' ', src)
-    return src
+    """Remove JML annotations and ordinary Java comments (a lexer that leaves string / char literals
+    intact, so "http://x" is not cut)."""
+    parts, last = [], 0
+    for s_, e_, _ in java_comments(src):
+        parts.append(src[last:s_])
+        parts.append(" ")
+        last = e_
+    parts.append(src[last:])
+    return "".join(parts)
 
 
 def extract_method_body(src: str, method_name: str) -> Optional[str]:
@@ -1482,11 +1578,60 @@ def _java_tokens(code: str):
         return re.sub(r"\s+", " ", code).strip()
 
 
+def _norm_node(x):
+    """A javalang node as a comparable value: positions and documentation dropped, `{ single statement }`
+    blocks collapsed (braces added to place an annotation are not a change)."""
+    if isinstance(x, jtree.BlockStatement) and x.statements and len(x.statements) == 1:
+        return _norm_node(x.statements[0])
+    if isinstance(x, jtree.Node):
+        return (type(x).__name__,
+                tuple((a, _norm_node(getattr(x, a, None))) for a in x.attrs if a != "documentation"))
+    if isinstance(x, (list, tuple)):
+        return tuple(_norm_node(y) for y in x)
+    if isinstance(x, set):
+        return tuple(sorted(str(y) for y in x))
+    return x
+
+
+def _class_members(src: str, method_name: str) -> Optional[dict]:
+    """key -> normalized node of every member of the class that declares `method_name` (other than that
+    method): methods and constructors by (name, parameter types), fields by their declarator names. None
+    if the source cannot be parsed."""
+    wrapped, _ = JavaMethodParser._ensure_class(src)
+    try:
+        tree = javalang.parse.parse(wrapped)
+    except Exception:
+        return None
+    owner = None
+    for path, node in tree:
+        if isinstance(node, jtree.MethodDeclaration) and node.name == method_name:
+            owners = [x for x in path if isinstance(x, jtree.ClassDeclaration)]
+            owner = owners[-1] if owners else None
+            break
+    if owner is None:
+        return None
+    out = {}
+    for m in owner.body:
+        if isinstance(m, (jtree.MethodDeclaration, jtree.ConstructorDeclaration)):
+            if isinstance(m, jtree.MethodDeclaration) and m.name == method_name:
+                continue
+            key = ("method", m.name, tuple(str(_norm_node(p.type)) for p in (m.parameters or [])))
+        elif isinstance(m, jtree.FieldDeclaration):
+            key = ("field", tuple(d.name for d in m.declarators))
+        else:
+            key = (type(m).__name__, getattr(m, "name", None))
+        out[key] = _norm_node(m)
+    return out
+
+
 def check_integrity(bench_src: str, llm_src: str,
                     bench_parsed: dict, llm_parsed: dict) -> dict:
     """
     F10: verify the LLM only added annotations.
-    Returns {"class_renamed", "signature_changed", "body_modified", "reason"}.
+    Returns {"class_renamed", "signature_changed", "body_modified", "members_modified", "reason"}.
+    The target method must keep its signature and body; every other member of the benchmark class
+    (helper methods, fields, constructors) must be present and unchanged (added members are allowed:
+    e.g. pure helper methods for the specification).
     """
     res = {"class_renamed": False, "signature_changed": False,
            "body_modified": False, "reason": ""}
@@ -1525,8 +1670,60 @@ def check_integrity(bench_src: str, llm_src: str,
             res["body_modified"] = True
             reasons.append("method body differs from benchmark")
 
+    b_mem = _class_members(bench_src, bench_parsed["method_name"])
+    l_mem = _class_members(llm_src, llm_parsed["method_name"])
+    res["members_modified"] = False
+    if b_mem is not None and l_mem is not None:
+        changed = [k for k in b_mem if l_mem.get(k) != b_mem[k]]
+        if changed:
+            res["members_modified"] = True
+            res["body_modified"] = True          # consumers treat any change of the program alike
+            reasons.append("other members changed: " + ", ".join(str(k[1]) for k in changed[:5]))
+
     res["reason"] = "; ".join(reasons)
     return res
+
+
+def jml_assume_in_body(src: str, method_name: str) -> bool:
+    """True if a JML `assume` annotation appears inside the body of `method_name` (it lets OpenJML verify
+    any specification; the RQ4 agent tools reject it)."""
+    code = mask_comments_and_literals(src)
+    m = re.search(r"\b" + re.escape(method_name) + r"\s*\([^)]*\)\s*(?:throws[^{]*)?\{", code)
+    if not m:
+        return False
+    depth, j = 1, m.end()
+    while j < len(code) and depth:
+        depth += {"{": 1, "}": -1}.get(code[j], 0)
+        j += 1
+    for s_, e_, _ in java_comments(src):
+        if m.end() <= s_ < j:
+            body = src[s_ + 2:e_]
+            if body.startswith("@") and re.search(r"\bassume\b", body):
+                return True
+    return False
+
+
+def agent_code_violation(original_code: str, code: str) -> Optional[str]:
+    """
+    The RQ4 agent tools' rule for a tool call (identical for every agent): a reason if `code` changes the
+    program (class name, the method's signature or body, any other member of the class) or puts a JML
+    `assume` inside the method body; None if the call may run. Code that cannot be parsed is let through
+    (OpenJML reports the syntax error).
+    """
+    if not original_code:
+        return None
+    try:
+        parser = JavaMethodParser()
+        orig = parser.parse(original_code)
+        new = parser.parse(code, orig["method_name"])
+        r = check_integrity(original_code, code, orig, new)
+    except Exception:
+        return None
+    if r["class_renamed"] or r["signature_changed"] or r["body_modified"]:
+        return r["reason"] or "code differs from the original program"
+    if jml_assume_in_body(code, orig["method_name"]):
+        return "JML `assume` inside the method body (it would make any specification verify)"
+    return None
 
 
 # ============================================================
@@ -1907,72 +2104,89 @@ def _find_method_line(source: str, method_name: str | None = None) -> int | None
 
 def extract_jml_spec(source: str, method_name: str | None = None) -> MethodSpec:
     """
-    Extract the raw JML comment block from above the method declaration.
+    Extract the method's JML specification.
 
-    Uses ``javalang`` to locate the method, then walks backwards to
-    collect contiguous JML comment lines (``//@`` or ``/*@ … @*/``).
-    The block is returned as-is in a ``MethodSpec``, preserving the
-    exact LLM-generated annotations.
+    The specification is every JML annotation comment between the end of the previous class member (or
+    the class's `{`) and the method's name: `//@ ..` line annotations and `/*@ .. @*/` block annotations,
+    whatever blank lines, Java annotations or ordinary comments lie in between. Ordinary comments (`//`,
+    `/* */`, Javadoc `/** */`, including a Javadoc `@requires` tag) are not JML and are ignored, as
+    OpenJML ignores them; comments nested inside a JML annotation (`//@ requires x > 0; // note`) are
+    removed. The result is returned as normalized `//@ ..` lines (one per annotation line) in a
+    ``MethodSpec``; `helpers` is the source of all other class members (the JML region and the method
+    excluded).
     """
     lines = source.splitlines()
-    method_line = _find_method_line(source, method_name)
-
-    if method_line is not None:
-        # Walk backwards from the line before the method declaration.
-        # Skip blank lines and Java annotations (@Override etc.) first,
-        # but stop at JML block comment endings (@*/ or */).
-        end = method_line - 2  # 0-based index of the line before method
-        while end >= 0:
-            s = lines[end].strip()
-            # Stop at JML-related lines
-            if (
-                s.startswith("//@")
-                or s.startswith("/*@")
-                or s.endswith("@*/")
-                or s.endswith("*/")
-            ):
-                break
-            # Skip blank lines and Java annotations (@Override, etc.)
-            if not s or s.startswith("@"):
-                end -= 1
-            else:
-                break
-
-        # Now walk backwards collecting the JML block.
-        start = end
-        in_block_comment = False
-        while start >= 0:
-            s = lines[start].strip()
-            if s.endswith("@*/") or s.endswith("*/"):
-                in_block_comment = True
-            if in_block_comment:
-                if s.startswith("/*@") or s.startswith("/*"):
-                    in_block_comment = False
-                start -= 1
-                continue
-            if s.startswith("//@"):
-                start -= 1
-                continue
-            break
-        jml_block = "\n".join(lines[start + 1 : end + 1])
-    else:
-        # Fallback: collect all //@ lines from the source
-        jml_lines = [
-            l
-            for l in lines
-            if l.strip().startswith("//@") or l.strip().startswith("/*@")
-        ]
-        jml_block = "\n".join(jml_lines)
-
+    region = _jml_region(source, method_name)
+    if region is not None:
+        r_start, r_end, body_open, meth_close, body_close = region
+        anns = [(s, e, k) for s, e, k in java_comments(source) if r_start <= s < r_end]
+    else:                                           # method not found: every JML annotation of the file
+        anns = java_comments(source)
+    jml_block = "\n".join(_jml_lines(source, anns))
     helpers = ""
-    if method_line is not None:
-        try:
-            helpers = _other_members(lines, start + 1, method_line - 1)
-        except Exception:
-            helpers = ""
+    if region is not None:
+        members = (source[body_open + 1: r_start] + "\n" + source[meth_close + 1: body_close]).strip("\n")
+        helpers = members if members.strip() else ""
     imports = "\n".join(l.strip() for l in lines
                         if re.match(r"^\s*import\s+(static\s+)?[\w.]+(\.\*)?\s*;", l))
     return MethodSpec(jml_block=jml_block, helpers=helpers, imports=imports)
+
+
+def _jml_lines(source: str, comments) -> list[str]:
+    """Normalized `//@ ..` lines of the JML annotations among `comments` (ordinary comments skipped)."""
+    out = []
+    for s, e, kind in comments:
+        if kind == "line":
+            content = source[s + 2:e]
+            if not content.startswith("@"):
+                continue                               # `// ..`: an ordinary comment
+            inner = [content.lstrip("@")]
+        else:
+            content = source[s + 2:e - 2] if source[s:e].endswith("*/") else source[s + 2:e]
+            if not content.startswith("@"):
+                continue                               # `/* ..*/` or Javadoc `/** ..*/`
+            inner = content.lstrip("@").rstrip("@").splitlines()
+        for line in strip_jml_inner_comments("\n".join(inner)).splitlines():
+            line = re.sub(r"^\s*@+", "", line).strip()
+            if line:
+                out.append("//@ " + line)
+    return out
+
+
+def _jml_region(source: str, method_name: str | None):
+    """
+    Offsets for the target method: (region start, region end, class-body `{`, method-body `}`,
+    class-body `}`). The region runs from just after the previous member (the last `;`, `{` or `}` of code
+    before the method) to the method's name; comments and literals are ignored when looking for code.
+    None if the method or its class cannot be located.
+    """
+    line = _find_method_line(source, method_name)
+    if line is None:
+        return None
+    code = mask_comments_and_literals(source)
+    offs = [0]
+    for l in source.splitlines(keepends=True):
+        offs.append(offs[-1] + len(l))
+    if line - 1 >= len(offs):
+        return None
+    name = method_name or "solve"
+    m = re.compile(r"\b" + re.escape(name) + r"\s*\(").search(code, offs[line - 1])
+    if not m:
+        m = re.compile(r"\b\w+\s*\(").search(code, offs[line - 1])
+        if not m:
+            return None
+    name_at = m.start()
+    prev = max(code.rfind(ch, 0, name_at) for ch in ";{}")
+    classes = list(re.finditer(r"\bclass\s+\w+", code[:name_at]))
+    if prev < 0 or not classes:
+        return None
+    body_open = _first_code_brace(code, classes[-1].end())
+    body_close = _match_brace(code, body_open) if body_open >= 0 else -1
+    meth_open = _first_code_brace(code, m.end())
+    meth_close = _match_brace(code, meth_open) if meth_open >= 0 else -1
+    if min(body_open, body_close, meth_open, meth_close) < 0:
+        return None
+    return prev + 1, name_at, body_open, meth_close, body_close
 
 
 def _match_brace(text: str, open_idx: int) -> int:
@@ -2066,6 +2280,8 @@ class ReadOp:
     # array_2d | array_2d_rc |
     # map | set | list_direct
     group_idx: int = -1  # index within the grouped-scalars line
+    # array_2d_rc: whether Test.java reads the r row lines when c == 0 (FB: always; SGB: only if c > 0)
+    rows_when_no_cols: bool = True
 
 
 # javalang AST helpers for Test.java analysis
@@ -2392,6 +2608,9 @@ def detect_input_format(test_src: str, params: list[dict]) -> list[ReadOp]:
             if len(ordered_params) != len(params):
                 ordered_params = list(params)  # fallback
 
+    # SGB tests read the rows of an r x c matrix in `for (i < r && c > 0)`: no row lines when c == 0
+    rows_when_no_cols = not re.search(r"<\s*\w+\s*&&\s*\w+\s*>\s*0", test_src or "")
+
     # --- build ReadOps in input order -------------------------------------
     for pi, p in enumerate(ordered_params):
         jtype = p["jtype"]
@@ -2413,7 +2632,7 @@ def detect_input_format(test_src: str, params: list[dict]) -> list[ReadOp]:
             # Nested list (e.g. List<List<Integer>>) → 2D-style input
             if jtype.generic_args and _is_nested_collection(jtype.generic_args[0]):
                 mode = "array_2d_rc" if has_2d_rc else "array_2d"
-                ops.append(ReadOp(name, jtype, mode))
+                ops.append(ReadOp(name, jtype, mode, rows_when_no_cols=rows_when_no_cols))
             else:
                 ops.append(ReadOp(name, jtype, "list_direct"))
             continue
@@ -2421,7 +2640,7 @@ def detect_input_format(test_src: str, params: list[dict]) -> list[ReadOp]:
         # --- 2-D+ array ---
         if jtype.is_array and jtype.array_dims >= 2:
             mode = "array_2d_rc" if has_2d_rc else "array_2d"
-            ops.append(ReadOp(name, jtype, mode))
+            ops.append(ReadOp(name, jtype, mode, rows_when_no_cols=rows_when_no_cols))
             continue
 
         # --- char[] read as one line (Test.java: line.toCharArray()) ---
@@ -2454,8 +2673,16 @@ def detect_input_format(test_src: str, params: list[dict]) -> list[ReadOp]:
 # Scalar value parser
 
 
-def _parse_scalar(type_name: str, s: str) -> Any:
-    """Convert a string token to a typed Python value."""
+def _java_split(line: str) -> list[str]:
+    """Java's `line.trim().split("\\s+")`: an empty (or blank) line gives [""], not []."""
+    t = line.strip()
+    return t.split() if t else [""]
+
+
+def _parse_scalar(type_name: str, s: str, raw: bool = False) -> Any:
+    """Convert a string token to a typed Python value (raw: a String token is kept exactly)."""
+    if raw and type_name == "String":
+        return s
     s = s.strip()
     if type_name in ("int", "Integer", "short", "Short", "byte", "Byte"):
         return int(s)
@@ -2536,8 +2763,9 @@ def parse_input(input_str: str, ops: list[ReadOp]) -> dict[str, Any]:
 
         # ---- 1-D array, no size prefix ------------------------------------
         elif op.mode == "array_direct":
-            parts = lines[pos].strip().split()
-            result[op.name] = [_parse_scalar(op.jtype.base, p) for p in parts]
+            parts = _java_split(lines[pos])
+            result[op.name] = [_parse_scalar(op.jtype.base, p, raw=True) for p in parts] \
+                if op.jtype.base == "String" else [_parse_scalar(op.jtype.base, p) for p in parts if p]
             pos += 1
 
         # ---- 1-D array, size on previous line -----------------------------
@@ -2551,19 +2779,16 @@ def parse_input(input_str: str, ops: list[ReadOp]) -> dict[str, Any]:
             else:
                 result[op.name] = []
 
-        # ---- 2-D array (formal): n_rows then rows -------------------------
+        # ---- 2-D array (formal): n_rows then rows (every row line is consumed) -------------------
         elif op.mode == "array_2d":
             elem = _leaf_element_type(op.jtype)
             n_rows = int(lines[pos].strip())
             pos += 1
             mat = []
             for _ in range(n_rows):
-                if pos < len(lines) and lines[pos].strip():
-                    row = [_parse_scalar(elem, x) for x in lines[pos].strip().split()]
-                    mat.append(row)
-                    pos += 1
-                else:
-                    mat.append([])
+                line = lines[pos] if pos < len(lines) else ""
+                pos += 1
+                mat.append([_parse_scalar(elem, x) for x in line.strip().split()])
             result[op.name] = mat
 
         # ---- 2-D array (specbench): rows cols then rows --------------------
@@ -2574,18 +2799,16 @@ def parse_input(input_str: str, ops: list[ReadOp]) -> dict[str, Any]:
             pos += 1
             mat = []
             if n_cols == 0:
-                # Empty-column matrix: no row data lines to read
+                # r empty rows; the FB tests still read (and ignore) r row lines, the SGB tests read none
                 mat = [[] for _ in range(n_rows)]
+                if op.rows_when_no_cols:
+                    pos += n_rows
             else:
                 for _ in range(n_rows):
-                    if pos < len(lines):
-                        row = [
-                            _parse_scalar(elem, x) for x in lines[pos].strip().split()
-                        ]
-                        mat.append(row)
-                        pos += 1
-                    else:
-                        mat.append([])
+                    line = lines[pos] if pos < len(lines) else ""
+                    pos += 1
+                    # Test.java reads exactly c tokens of each row line (extra tokens are ignored)
+                    mat.append([_parse_scalar(elem, x) for x in line.strip().split()[:n_cols]])
             result[op.name] = mat
 
         # ---- HashMap -------------------------------------------------------
@@ -2619,12 +2842,11 @@ def parse_input(input_str: str, ops: list[ReadOp]) -> dict[str, Any]:
         # ---- List / ArrayList / LinkedList (space-separated, no size) -----
         elif op.mode == "list_direct":
             etype = op.jtype.generic_args[0] if op.jtype.generic_args else "Integer"
-            line = lines[pos].strip()
-            if line:
-                parts = line.split()
-                result[op.name] = [_parse_scalar(etype, p) for p in parts]
+            if etype == "String":                    # Java: line.trim().split("\\s+") ("" -> [""])
+                result[op.name] = [_parse_scalar(etype, p, raw=True) for p in _java_split(lines[pos])]
             else:
-                result[op.name] = []
+                line = lines[pos].strip()
+                result[op.name] = [_parse_scalar(etype, p) for p in line.split()] if line else []
             pos += 1
 
         i += 1
@@ -2635,12 +2857,37 @@ def parse_input(input_str: str, ops: list[ReadOp]) -> dict[str, Any]:
 # Output string → typed Python value
 
 
-def parse_output(output_str: str, return_type: JType) -> Any:
+def detect_output_layout(test_src: str) -> dict:
     """
-    Parse a competitive-programming-style output string into a typed
-    Python value, guided by the method's return type.
+    How Test.java prints the result, from its source: `header` = the first print after the call prints
+    only the result's size (`result.length`, `result.size()`, `r + " " + c` with r/c taken from the
+    result) before the rows / elements; `sep` = the row's String.join separator if not blank (e.g. ", "), else " ".
     """
-    output_str = output_str.rstrip("\n")
+    src = test_src or ""
+    i = src.find("Solution.solve(")
+    tail = src[src.find(";", i) + 1:] if i >= 0 else ""
+    prints = re.findall(r"System\.out\.print(?:ln)?\s*\((.*?)\);", tail, re.S)
+    header = False
+    if len(prints) >= 2:
+        first = prints[0]
+        size_vars = set(re.findall(r"\b(\w+)\s*=\s*[^;,]*?\.(?:length|size\(\))", tail))
+        header = (bool(re.search(r"\.length\b|\.size\(\)", first)) and "stream" not in first
+                  and "join" not in first) or \
+                 (bool(size_vars) and set(re.findall(r"\b[A-Za-z_]\w*\b", first)) <= size_vars)
+    m = re.search(r'String\.join\(\s*"((?:[^"\\]|\\.)*)"', tail)
+    sep = m.group(1) if m and m.group(1).strip() else " "          # e.g. ", " (FB_ListifyList)
+    return {"header": header, "sep": sep}
+
+
+def parse_output(output_str: str, return_type: JType, layout: dict | None = None) -> Any:
+    """
+    Parse the text Test.java printed for the result into a typed Python value, guided by the return type
+    and by the print layout of Test.java (detect_output_layout): a size header line is skipped, rows are
+    split on the row separator, a String result is kept exactly (only the final newline removed) and
+    "null" is a null String. Ambiguous layouts (3-D arrays printed without shape) raise ValueError.
+    """
+    layout = layout or {"header": False, "sep": " "}
+    output_str = output_str[:-1] if output_str.endswith("\n") else output_str
 
     if return_type.base == "void":
         return None
@@ -2661,15 +2908,34 @@ def parse_output(output_str: str, return_type: JType) -> Any:
             d[_parse_scalar(ktype, parts[0])] = _parse_scalar(vtype, parts[1].strip())
         return d
 
-    # ---- 2-D+ array --------------------------------------------------------
-    if return_type.is_array and return_type.array_dims >= 2:
-        rows = []
-        for line in output_str.split("\n"):
-            line = line.strip()
-            if line:
-                row = [_parse_scalar(return_type.base, x) for x in line.split()]
-                rows.append(row)
-        return rows
+    def split_row(line: str, etype: str) -> list:
+        if layout["sep"].strip():                    # an explicit separator such as "," or ", "
+            return [] if line == "" else [_parse_scalar(etype, x, raw=True) for x in line.split(layout["sep"])]
+        return [_parse_scalar(etype, x) for x in line.split()]
+
+    def rows_of(etype: str) -> list:
+        lines = output_str.split("\n") if output_str != "" else []
+        if layout["header"]:
+            if not lines:
+                raise ValueError("missing size header")
+            n = int(lines[0].split()[0])
+            body = lines[1:]
+            if len(body) < n:
+                body += [""] * (n - len(body))       # empty last rows print as empty lines
+            return [split_row(l, etype) for l in body[:n]]
+        return [split_row(l, etype) for l in lines]
+
+    # ---- 2-D array ---------------------------------------------------------
+    if return_type.is_array and return_type.array_dims >= 3:
+        raise ValueError("3-D array output is printed without its shape: ambiguous")
+    if return_type.is_array and return_type.array_dims == 2:
+        return rows_of(return_type.base)
+
+    # ---- nested list (List<List<T>>) ----------------------------------------
+    if return_type.base in ("List", "ArrayList", "LinkedList") and return_type.generic_args \
+            and _is_nested_collection(return_type.generic_args[0]):
+        inner = re.sub(r"^\w+<\s*|\s*>$", "", return_type.generic_args[0])
+        return rows_of(inner or "Integer")
 
     # ---- char[] (one line of characters) ----------------------------------
     if return_type.is_array and return_type.array_dims == 1 and return_type.base in ("char", "Character"):
@@ -2692,6 +2958,9 @@ def parse_output(output_str: str, return_type: JType) -> Any:
 
     # ---- Set / HashSet / TreeSet -------------------------------------------
     if return_type.base in ("Set", "HashSet", "TreeSet"):
+        if layout["header"]:
+            lines = output_str.split("\n")
+            output_str = lines[1] if len(lines) > 1 else ""
         tokens = output_str.strip().split()
         etype = return_type.generic_args[0] if return_type.generic_args else "Integer"
         if not tokens or tokens == [""]:
@@ -2699,6 +2968,8 @@ def parse_output(output_str: str, return_type: JType) -> Any:
         return [_parse_scalar(etype, t) for t in tokens]
 
     # ---- scalar ------------------------------------------------------------
+    if return_type.base == "String":
+        return None if output_str == "null" else output_str   # exactly what println printed
     return _parse_scalar(return_type.base, output_str.strip())
 
 
@@ -2934,12 +3205,17 @@ class JvmSlots:
             self.cv.notify_all()
 
 
-JVM_SLOTS = JvmSlots(int(os.environ.get("SPEC_HARNESS_JVM_SLOTS", "0") or 0))
+def _slots(n: int) -> int:
+    """0 = no cap; otherwise at least 2 (a dual decision needs 2 slots at once, 1 would deadlock)."""
+    return 0 if n <= 0 else max(2, n)
+
+
+JVM_SLOTS = JvmSlots(_slots(int(os.environ.get("SPEC_HARNESS_JVM_SLOTS", "0") or 0)))
 
 
 def set_jvm_slots(n: int) -> None:
     with JVM_SLOTS.cv:
-        JVM_SLOTS.n = n
+        JVM_SLOTS.n = _slots(n)
         JVM_SLOTS.cv.notify_all()
 
 
@@ -2951,9 +3227,15 @@ _LIVE_LOCK = threading.Lock()
 STOPPING = False                      # set by the stop handler: results computed from now on are not saved
 
 
-def _track(p: subprocess.Popen) -> None:
+def _launch(cmd: list, **kw) -> subprocess.Popen:
+    """Start an OpenJML process in its own session and track its group, atomically with respect to the
+    stop handler: once stopping, nothing new is launched."""
     with _LIVE_LOCK:
+        if STOPPING:
+            raise RuntimeError("stopping: no new OpenJML runs")
+        p = subprocess.Popen(cmd, preexec_fn=os.setsid, **kw)
         _LIVE_GROUPS.add(p.pid)       # setsid: the group id is the child's pid
+        return p
 
 
 def _kill_group(p: subprocess.Popen) -> None:
@@ -2984,7 +3266,8 @@ def install_stop_handlers(*also) -> None:
     no half-scored task is saved; the task is redone on resume (its lock belongs to a dead process)."""
     def stop(signum, frame):
         global STOPPING
-        STOPPING = True
+        with _LIVE_LOCK:
+            STOPPING = True           # no launch after this point (_launch checks it under the lock)
         kill_live_groups()
         for f in also:
             try:
@@ -2992,6 +3275,7 @@ def install_stop_handlers(*also) -> None:
             except Exception:
                 pass
         print(f"stopped by signal {signum}: OpenJML processes killed", file=sys.stderr, flush=True)
+        kill_live_groups()            # again: a group registered while the first pass ran
         os._exit(128 + signum)
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, stop)
@@ -3036,17 +3320,10 @@ class OpenJMLRunnerPersistent:
         ]
         JVM_SLOTS.acquire(1)
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                preexec_fn=os.setsid,
-            )
+            proc = _launch(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except Exception:
             JVM_SLOTS.release(1)
             raise
-        _track(proc)
         try:
             stdout, stderr = proc.communicate(timeout=self.timeout)
             returncode = proc.returncode
@@ -3075,14 +3352,16 @@ class OpenJMLRunnerPersistent:
                 "--nonnull-by-default", "--arithmetic-failure=quiet", "-nowarn", path]
 
     def decide(self, accept_src: str, refute_src: str, class_name: str,
-               label: str) -> tuple[str, dict]:
+               label: str, wait_both: bool = False) -> tuple[str, dict]:
         """
         Run the accept and refute stubs concurrently. Returns (decision, info):
           "accept"  - the accept stub verified (the spec provably holds)
           "reject"  - the refute stub verified (the spec provably fails)
           "unknown" - neither verified within the timeout
-          "error"   - both stubs failed to compile / the tool failed
-        Each stub's OpenJML output is kept next to it (openjml.out).
+          "error"   - both stubs failed to compile / the tool failed, or (wait_both) both verified
+        wait_both (vacuity guard, used when the spec's helper methods carry JML contracts, which could be
+        contradictory): do not stop at the first proof; wait for the other side (same timeout) and report
+        "error" (vacuous) if it verifies too. Each stub's OpenJML output is kept next to it (openjml.out).
         """
         import time
         base = os.path.join(self.output_dir, re.sub(r"[^\w\-]", "_", label))
@@ -3096,9 +3375,11 @@ class OpenJMLRunnerPersistent:
                 with open(path, "w") as fh:
                     fh.write(src)
                 out = open(os.path.join(d, "openjml.out"), "w")
-                p = subprocess.Popen(self._cmd(path), stdout=out, stderr=subprocess.STDOUT,
-                                     text=True, preexec_fn=os.setsid)
-                _track(p)
+                try:
+                    p = _launch(self._cmd(path), stdout=out, stderr=subprocess.STDOUT, text=True)
+                except Exception:
+                    out.close()
+                    raise
                 procs[side] = (p, out, os.path.join(d, "openjml.out"))
         except Exception:                         # launch failed: stop what started, free the slots
             for p, out, _ in procs.values():
@@ -3106,23 +3387,30 @@ class OpenJMLRunnerPersistent:
                 out.close()
             JVM_SLOTS.release(2)
             raise
-        start, verdicts = time.time(), {}
+        start, verdicts = time.monotonic(), {}
         try:
-            while len(verdicts) < 2 and time.time() - start < self.timeout:
+            while len(verdicts) < 2 and time.monotonic() - start < self.timeout:
                 for side, (p, out, opath) in procs.items():
                     if side in verdicts or p.poll() is None:
                         continue
+                    _kill_group(p)                # the side has ended: stop any solver it left behind
                     out.close()
                     with open(opath, errors="ignore") as fh:
                         verdicts[side] = self._parse(p.returncode, fh.read())
-                    if verdicts[side] == VerifyResult.OK:
+                    if verdicts[side] == VerifyResult.OK and not wait_both:
                         return ("accept" if side == "accept" else "reject"), \
                                {"verdicts": {k: v.value for k, v in verdicts.items()},
-                                "seconds": round(time.time() - start, 2)}
+                                "seconds": round(time.monotonic() - start, 2)}
                 time.sleep(0.2)
             info = {"verdicts": {k: v.value for k, v in verdicts.items()},
-                    "seconds": round(time.time() - start, 2),
+                    "seconds": round(time.monotonic() - start, 2),
                     "timed_out": [s for s in procs if s not in verdicts]}
+            ok = [side for side, v in verdicts.items() if v == VerifyResult.OK]
+            if len(ok) == 2:
+                return "error", {**info, "vacuous": True}      # both provable: contradictory context
+            if len(ok) == 1:
+                info["wait_both"] = True
+                return ("accept" if ok[0] == "accept" else "reject"), info
             if len(verdicts) == 2 and all(v == VerifyResult.ERROR for v in verdicts.values()):
                 return "error", info
             return "unknown", info
@@ -3286,14 +3574,24 @@ def _evaluate_one_pair_dual(
     """
     result = PairResult(pair_idx=pair_idx)
     guard = POST_STUB_MODE != "strip"
+    vacuity_guard = helpers_have_contracts(spec)
+
+    def failed(e):
+        # a check that raised (stub construction / rendering): an ERROR verdict with the exception,
+        # excluded from the denominator and counted, never a silently dropped check (or pair)
+        print(f"CHECK ERROR [{task_id}] {pair.label}: {type(e).__name__}: {e}", file=sys.stderr)
+        return "error", {"exception": f"{type(e).__name__}: {e}"}, ""
 
     def post_check(output, lbl):
-        stubs = builder.dual_post_stubs(parsed, spec, pair.inputs, output,
-                                        mutated_arg=mutated_arg, guard_single_case=guard)
-        if stubs is None:
-            return None, {}, ""
-        decision, info = runner.decide(stubs[0], stubs[1], cname, lbl)
-        return decision, info, stubs[0]
+        try:
+            stubs = builder.dual_post_stubs(parsed, spec, pair.inputs, output,
+                                            mutated_arg=mutated_arg, guard_single_case=guard)
+            if stubs is None:
+                return None, {}, ""
+            decision, info = runner.decide(stubs[0], stubs[1], cname, lbl, wait_both=vacuity_guard)
+            return decision, info, stubs[0]
+        except Exception as e:
+            return failed(e)
 
     if spec.postcondition is not None:         # always true here: D13 returns earlier without ensures
         # PostCorrectness: the spec must accept the true output
@@ -3305,8 +3603,14 @@ def _evaluate_one_pair_dual(
             _log(verbose, task_id, "PostCorrectness", pair.label, VerifyResult.OK if d == "accept"
                  else VerifyResult.FAIL, d == "accept")
         # PostCompleteness: the spec must reject every mutated output
-        mutants = (mutator.mutate_same_length(pair.output, out_type.base) if mutated_arg is not None
-                   else mutator.mutate(out_type, pair.output))
+        try:
+            mutants = (mutator.mutate_same_length(pair.output, out_type.base) if mutated_arg is not None
+                       else mutator.mutate(out_type, pair.output))
+        except Exception as e:
+            d, info, stub = failed(e)
+            result.post_complete_details.append({"label": pair.label, "mutant": "", "verdict": d,
+                                                 "decision_info": info, "killed": None, "stub": stub})
+            mutants = []
         for mut in mutants:
             d, info, stub = post_check(mut, f"post_complete_{pair.label}_{str(mut)[:20]}")
             if d is None:
@@ -3319,14 +3623,23 @@ def _evaluate_one_pair_dual(
     policy = MISSING_REQUIRES_POLICY
     if not spec.has_requires and policy == "zero":
         return result
-    psi = builder.effective_pre(parsed, spec, implicit_nonnull=(policy == "jml"))
+    try:
+        psi = builder.effective_pre(parsed, spec, implicit_nonnull=(policy == "jml"))
+        psi_error = None
+    except Exception as e:
+        psi, psi_error = None, e
 
     def pre_check(case, lbl):
+        if psi_error is not None:
+            return failed(psi_error)
         if psi is None:                      # precondition is `true`: admitted, no proof needed
             return "accept", {"trivial": True}, ""
-        a, r = builder.dual_pre_stubs(parsed, spec, case.inputs, psi)
-        d, info = runner.decide(a, r, cname, lbl)
-        return d, info, a
+        try:
+            a, r = builder.dual_pre_stubs(parsed, spec, case.inputs, psi)
+            d, info = runner.decide(a, r, cname, lbl, wait_both=vacuity_guard)
+            return d, info, a
+        except Exception as e:
+            return failed(e)
 
     d, info, stub = pre_check(valid_input_case, f"pre_correct_{valid_input_case.label}")
     result.pre_correct_detail = {
@@ -3338,6 +3651,22 @@ def _evaluate_one_pair_dual(
             "label": case.label, "verdict": d, "decision_info": info,
             "rejected": True if d == "reject" else False if d == "accept" else None, "stub": stub})
     return result
+
+
+_CONTRACT_WORDS = re.compile(r"\b(requires|ensures|pre|post|axiom|invariant|represents|signals|constraint|"
+                             r"initially)(_redundantly)?\b")
+
+
+def helpers_have_contracts(spec: MethodSpec) -> bool:
+    """True if the helper members copied into the stubs carry JML contracts of their own. Contradictory
+    helper contracts make both the accept and the refute stub provable, so decisions then wait for both
+    sides (decide(wait_both=True)) and report such a check as an error."""
+    src = spec.helpers or ""
+    for s_, e_, kind in java_comments(src):
+        body = src[s_ + 2:e_]
+        if body.startswith("@") and _CONTRACT_WORDS.search(body):
+            return True
+    return False
 
 
 def _should_run_pre(spec: MethodSpec) -> bool:
@@ -3498,6 +3827,7 @@ def evaluate_problem_detailed(
 
     # detect input format from Test.java
     read_ops = detect_input_format(test_src, bench_params)
+    out_layout = detect_output_layout(test_src)          # how Test.java prints the result
 
     # parse io_pairs into TestPair / InputCase objects
     test_pairs: list[TestPair] = []
@@ -3506,12 +3836,10 @@ def evaluate_problem_detailed(
     for idx, pair in enumerate(io_pairs):
         try:
             inputs_bench = parse_input(pair["input"], read_ops)
-            output = parse_output(pair["output"], out_type)
+            output = parse_output(pair["output"], out_type, out_layout)
             if mutated_bench is not None:
-                # in-place output must have the argument's length; empty outputs
-                # mean the benchmark test did not record the result
-                if not isinstance(output, list) or len(output) != len(inputs_bench.get(mutated_bench) or []) \
-                        or not output:
+                # the in-place output must have the argument's length (an empty array stays empty)
+                if not isinstance(output, list) or len(output) != len(inputs_bench.get(mutated_bench) or []):
                     continue
         except Exception as e:
             if verbose:
@@ -3564,6 +3892,7 @@ def evaluate_problem_detailed(
     # launch one thread per test pair
     n_threads = len(test_pairs)
     pair_results: list[PairResult] = [None] * n_threads  # type: ignore
+    pair_errors: list[str] = []          # pairs whose evaluation raised (should not happen: checks catch)
 
     mutated_arg = None
     if mutated_bench is not None:
@@ -3582,6 +3911,7 @@ def evaluate_problem_detailed(
                 try:
                     pair_results[idx] = fut.result()
                 except Exception as e:
+                    pair_errors.append(f"pair {idx}: {type(e).__name__}: {e}")
                     print(f"ERROR [{task.task_id}] pair {idx}: {e}", file=sys.stderr)
 
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
@@ -3680,6 +4010,11 @@ def evaluate_problem_detailed(
             "evaluable": v.total > 0,
             "details": v.details,
         }
+    output["pair_errors"] = pair_errors
+    output["pairs_unparsed"] = [i for i in range(len(io_pairs)) if f"case_{i}" not in
+                                {tp.label for tp in test_pairs}]
+    output["check_exceptions"] = sum(1 for det in (pc_details, pcl_details, prc_details, prl_details)
+                                     for d in det if (d.get("decision_info") or {}).get("exception"))
     output["not_evaluable"] = [k for k, v in results.items() if v.total == 0]
     output["post_all_unknown"] = (results["post_correctness"].total == 0
                                   and results["post_correctness"].unknowns > 0)

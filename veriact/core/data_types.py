@@ -7,6 +7,13 @@ from typing import Any
 
 HARNESS_PASS_THRESHOLD = 0.75
 
+# RQ4 agent-tool settings, identical for VeriAct and the Claude Code / Codex tools:
+MAX_TOOL_CALLS = 10          # verify + run_spec_harness calls per task (rejected calls count too)
+HARNESS_FEEDBACK_PAIRS = 5   # run_spec_harness scores the task's first 5 feedback pairs (+ all its invalid inputs)
+TOOL_TIMEOUT_S = 1800        # outer timeout of one tool call (the tool process and its OpenJML groups are killed)
+DEFAULT_MAX_STEPS = 20       # LLM steps: room for the 10 tool calls + task_complete + unparseable outputs
+DEFAULT_REASONING_EFFORT = "medium"   # gpt-5.4 at effort medium, as Codex runs it
+
 
 @dataclass
 class TestCase:

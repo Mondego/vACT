@@ -20,8 +20,15 @@ Outputs (<out>/):
   rq3_per_spec.csv                  `csv` subcommand (collect.py builds the merged CSVs)
   progress.log, run_meta.json
 
-Resumable and shardable: units are claimed with lock files, finished units are skipped, and
---shard i/n splits the units deterministically between machines or sessions.
+Resumable and shardable: work is claimed with lock files, finished units are skipped, and
+--shard i/n splits the work deterministically between machines or sessions.
+
+Duplicate reuse (default; --no-reuse turns it off): units with the same benchmark, task and byte-identical
+final_code form a group. The group's first unit (by unit id) is scored and its result is copied to every other
+member (`reused_from` = that unit, `seconds` 0, own metadata), so every spec keeps its own result row. The
+harness builds its checks only from the task, its suite and the code, so the copies are exactly what scoring
+them again would give (up to timeouts, which reuse makes consistent). --shard splits by group, so a group
+never spans two machines.
 
   python runners/rq3_run.py run --out rq3_out --bench sgb fb --jvm-slots 60
   python runners/rq3_run.py run --out rq3_out --shard 0/2     # this machine takes half
@@ -31,8 +38,10 @@ Resumable and shardable: units are claimed with lock files, finished units are s
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -120,6 +129,19 @@ def result_path(out: str, u: dict) -> str:
     return os.path.join(out, "results", u["file"], f"{u['task_id']}.json")
 
 
+def group_key(u: dict) -> str:
+    """Duplicate group: benchmark, task and the sha256 of the exact final_code."""
+    return f"{u['bench']}|{u['task_id']}|{hashlib.sha256(u['final_code'].encode()).hexdigest()}"
+
+
+def copy_record(rec: dict, u: dict) -> dict:
+    """The representative's result as the result of the duplicate unit u."""
+    out = json.loads(json.dumps(rec))
+    out.update({k: u[k] for k in ("unit", "file", "task_id", "approach", "bench", "model", "prompt")})
+    out.update(reused_from=rec["unit"], seconds=0.0, rep_seconds=rec.get("seconds"), finished=C.now())
+    return out
+
+
 def cmd_run(args) -> int:
     import spec_harness.eval_llm_response as ev
     ev.set_jvm_slots(args.jvm_slots)
@@ -131,50 +153,77 @@ def cmd_run(args) -> int:
     if args.units_file:                                   # e.g. the T8 sensitivity sample
         want = {l.strip() for l in open(args.units_file) if l.strip()}
         all_units = [u for u in all_units if u["unit"] in want]
-    mine = [u for u in all_units if C.shard_of(u["unit"], n) == i]
-    todo = []
-    for u in mine:
+    groups = collections.defaultdict(list)                # duplicate groups (a single unit with --no-reuse)
+    for u in all_units:
+        groups[u["unit"] if args.no_reuse else group_key(u)].append(u)
+    for g in groups.values():
+        g.sort(key=lambda u: u["unit"])
+
+    def done(u):
         p = result_path(args.out, u)
-        if os.path.exists(p) and not args.force:
-            if not (args.retry_errors and json.load(open(p)).get("status") == "error"):
-                continue
-        todo.append(u)
+        return os.path.exists(p) and not args.force and not (
+            args.retry_errors and json.load(open(p)).get("status") == "error")
+    mine = {k: g for k, g in groups.items() if C.shard_of(k, n) == i}
+    todo = [g for k, g in sorted(mine.items()) if not all(done(u) for u in g)]
+    n_mine = sum(len(g) for g in mine.values())
     suites = {b: {t["task_id"]: t for t in json.load(open(SUITES[b]))} for b in args.bench}
     meta_p = os.path.join(args.out, "run_meta.json")
-    if os.path.exists(meta_p):                          # a resumed run must keep its pair count
-        old = json.load(open(meta_p)).get("args", {}).get("pairs", 0)
-        if old != args.pairs:
-            C.log(f"ERROR: {args.out} was run with --pairs {old}, not {args.pairs}; use another --out")
+    pinned = ("pairs", "no_reuse", "shard", "bench", "files", "limit", "units_file", "suite")
+    if os.path.exists(meta_p):                          # a resumed run must keep what defines its units
+        old = json.load(open(meta_p)).get("args", {})
+        diff = [k for k in pinned if k in old and old.get(k) != vars(args).get(k)]
+        if diff:
+            C.log(f"ERROR: {args.out} was run with different " + ", ".join(
+                f"--{k.replace('_', '-')} ({old.get(k)!r} vs {vars(args).get(k)!r})" for k in diff) +
+                "; resume with the same options or use another --out")
             return 2
     info = C.bundle_info()
     C.atomic_json(os.path.join(args.out, "run_meta.json"),
                   {"rq": "RQ3", "args": {k: v for k, v in vars(args).items() if k != "func"}, "provenance": info,
-                   "units_total": len(all_units), "units_shard": len(mine), "units_todo": len(todo), "started": C.now(),
+                   "units_total": len(all_units), "units_shard": n_mine, "groups_shard": len(mine),
+                   "groups_todo": len(todo), "units_todo": sum(len(g) for g in todo), "reuse": not args.no_reuse,
+                   "started": C.now(),
                    "suites": {b: SUITES[b] for b in args.bench}})
-    C.log(f"RQ3: {len(all_units)} units, shard {i}/{n}: {len(mine)}, to do {len(todo)} | workers {args.workers}, "
-          f"JVM slots {args.jvm_slots} | {info}")
+    C.log(f"RQ3: {len(all_units)} units in {len(groups)} groups, shard {i}/{n}: {n_mine} units in {len(mine)} "
+          f"groups, to do {len(todo)} groups ({sum(len(g) for g in todo)} units) | reuse {not args.no_reuse} | "
+          f"workers {args.workers}, JVM slots {args.jvm_slots} | {info}")
     prog = C.Progress(len(todo), os.path.join(args.out, "progress.log"))
 
-    def work(u):
-        lock = os.path.join(args.out, "locks", u["file"], f"{u['task_id']}.lock")
+    def work(g):
+        rep_u = g[0]
+        lock = os.path.join(args.out, "locks", rep_u["file"], f"{rep_u['task_id']}.lock")
         if not C.try_lock(lock, args.stale_hours):
-            return u, "locked"
+            return rep_u, "locked"
         try:
-            rec = score_unit(ev, suites[u["bench"]], u, args, info)
-            if ev.STOPPING:                                   # stopped mid-task: redo it on resume
-                return u, "stopped"
-            C.atomic_json(result_path(args.out, u), rec)
-            return u, rec["status"] + (f" {rec.get('seconds')}s" if "seconds" in rec else "")
+            p = result_path(args.out, rep_u)
+            if done(rep_u):                                   # resumed: only the copies are missing
+                rec = json.load(open(p))
+            else:
+                rec = score_unit(ev, suites[rep_u["bench"]], rep_u, args, info)
+                if ev.STOPPING:                               # stopped mid-task: redo it on resume
+                    return rep_u, "stopped"
+                C.atomic_json(p, rec)
+            for u in g[1:]:
+                if not done(u):
+                    C.atomic_json(result_path(args.out, u), copy_record(rec, u))
+            return rep_u, rec["status"] + (f" {rec.get('seconds')}s" if "seconds" in rec else "") + \
+                (f" (+{len(g) - 1} reused)" if len(g) > 1 else "")
         finally:
             C.unlock(lock)
 
     with ThreadPoolExecutor(args.workers) as pool:
-        futs = [pool.submit(work, u) for u in todo]
+        futs = {pool.submit(work, g): g for g in todo}
         for f in as_completed(futs):
-            u, st = f.result()
+            try:
+                u, st = f.result()
+            except Exception as e:                    # outside score_unit (disk, tar, ...): log, continue
+                u, st = futs[f][0], f"FAILED {type(e).__name__}: {e}"
             prog.tick(f"{u['unit']}: {st}")
-    C.log("RQ3 run finished")
-    return 0
+    left = [g for g in todo if not all(done(u) for u in g)]
+    C.log(f"RQ3 run finished: {len(todo) - len(left)} of {len(todo)} groups done" +
+          (f"; {len(left)} not done (locked by another live process, stopped, or failed): re-run the same "
+           f"command" if left else ""))
+    return 0 if not left else 3
 
 
 def cmd_status(args) -> int:
@@ -245,6 +294,8 @@ def main() -> int:
             p.add_argument("--keep-stubs", choices=["tar", "none"], default="tar")
             p.add_argument("--pairs", type=int, default=0,
                            help="score the first N evaluation pairs of the suite (0 = all; T8 chooses N)")
+            p.add_argument("--no-reuse", action="store_true",
+                           help="score every unit itself (default: byte-identical duplicates reuse one result)")
             p.add_argument("--force", action="store_true")
             p.add_argument("--retry-errors", action="store_true")
             p.add_argument("--stale-hours", type=float, default=12.0)

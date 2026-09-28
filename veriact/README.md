@@ -23,8 +23,36 @@ The three tools are the subcommands of [`cli.py`](veriact/cli.py):
 
 The agent supplies the full annotated code in `tool_input.jml_annotated_code` each
 step; the agent writes it to `Solution.java` in a per-task workspace and runs the
-CLI against it. There is **no attempt budget** here — the loop is bounded by
-`--max-steps` (each tool call ≈ one step, matching VeriAct).
+CLI against it.
+
+**RQ4 settings (identical to the Claude Code / Codex tools).**
+
+- *Budget:* 10 tool calls per task (`--max-tool-calls`), `verify` and `run_spec_harness`
+  combined. Every call submitted to a tool counts, including calls rejected by the
+  integrity rule and calls that time out. After 10 calls both tools refuse without
+  running and return
+  `{"error": "attempt budget exhausted (10/10)", "action": "call task_complete with your best spec", "attempts": 10, "max_attempts": 10}`.
+  Every `verify` result (and every error) carries top-level `attempts` / `max_attempts`;
+  every `run_spec_harness` score carries `"_budget": {"attempts", "max_attempts"}`.
+  LLM steps that are not tool calls (unparseable output, missing `jml_annotated_code`,
+  unknown/unavailable tool, `task_complete`) do not use the budget. The step limit
+  (`--max-steps`, default 20) only guards against endless unparseable output; when it is
+  hit, the final code is the last accepted code.
+- *Integrity / assume rule:* `harness_tool.agent_code_violation` rejects a call whose code
+  changes the class name, the method signature/body or any other class member, or puts a
+  JML `assume` in the method body (`code_modified`, the tool is not run, the call counts).
+  Only accepted code is written to `Solution.java`.
+- *Tool timeout:* 1800 s per tool call (`--tool-timeout`). The CLI runs in its own session;
+  on timeout the agent SIGTERMs its group (the CLI's stop handler kills every OpenJML
+  group it started), waits 10 s, then SIGKILLs the group. Observation:
+  `{"error": "tool timed out", "timeout": 1800, "attempts": .., "max_attempts": ..}`.
+- *Harness feedback:* `run_spec_harness` scores the task's first 5 feedback pairs
+  (`--harness-max-pairs`) plus all its invalid inputs.
+- *Model:* OpenAI models get `reasoning_effort` (`--reasoning-effort`, default `medium`,
+  as Codex runs gpt-5.4); it is recorded in `llm_calls.jsonl` (`reasoning_effort`,
+  `request_params`) and `run_meta.json`.
+- `run_single` exits with status 1 if a task failed (the failures are also written to
+  `failed_tasks.json`).
 
 ## Run (same UX as VeriAct)
 
@@ -35,12 +63,13 @@ Run from the repo root.
 python -m veriact.run.run_single \
     --benchmark benchmarks/specgenbench/sgb.json \
     --model gpt-4o --output-dir out --openjml-path openjml \
-    --max-steps 11 --planning_interval 5
+    --max-steps 20 --max-tool-calls 10 --tool-timeout 1800 \
+    --reasoning-effort medium --planning_interval 5
 
 # parallel
 python -m veriact.run.run_batch \
     --benchmark benchmarks/specgenbench/sgb.json \
-    --model gpt-4o --threads 4 --output-dir out --max-steps 11
+    --model gpt-4o --threads 4 --output-dir out --max-steps 20
 ```
 
 ### Ablation: no-harness
@@ -53,7 +82,7 @@ unavailable.
 
 ```bash
 python -m veriact.run.run_batch --benchmark benchmarks/specgenbench/sgb.json \
-    --model gpt-4o --threads 4 --output-dir out_nh --max-steps 11 --no-harness
+    --model gpt-4o --threads 4 --output-dir out_nh --max-steps 20 --no-harness
 ```
 
 **Scoring the no-harness output offline.** Since the no-harness arm never runs the
@@ -111,7 +140,7 @@ veriact/
 ```
 
 The OpenJML flags and mutant budget (k=5) in `tools/harness_tool.py` and `tools/verifier_tool.py`
-match the original VeriAct scorer/verifier. The harness tool scores on `max_pairs=10` pairs: with a
+match the original VeriAct scorer/verifier. The harness tool scores on `max_pairs=5` pairs (the agent tool; final scoring uses 10): with a
 `*_v2_feedback.json` benchmark these are the T5 feedback list, disjoint from the evaluation pairs used
 for final scoring. When the task carries `invalid_inputs` (validated T-, testset T6), PreComp uses exactly
 those; otherwise the old heuristic generator.
@@ -120,9 +149,9 @@ those; otherwise the old heuristic generator.
 
 | File | Content |
 |---|---|
-| `llm_calls.jsonl` | One line per model call (planning and action): request messages, response text, latency, response id, and normalized token usage (input incl. cached, cached, cache creation, output, reasoning, plus the provider's raw usage). Recording is per thread, so parallel tasks sharing one model object never mix. |
+| `llm_calls.jsonl` | One line per model call (planning and action): request messages, the other request parameters actually sent (`request_params`, e.g. `reasoning_effort`), response text, latency, response id, and normalized token usage (input incl. cached, cached, cache creation, output, reasoning, plus the provider's raw usage). Recording is per thread, so parallel tasks sharing one model object never mix. |
 | `tool_calls.jsonl` | One line per `verify` / `harness` / `submit` CLI call (code snapshot and hash, output, duration). |
-| `run_meta.json` | Model, mode, max steps, host, start/end, wall time, usage totals, tool-call counts, integrity blocks, step durations, hashes of the tools and the prompt, error if the run crashed. |
+| `run_meta.json` | Model, reasoning effort, model config, mode, max steps, tool-call budget / used / refused, tool timeout (and timeouts hit), harness pairs, host, start/end, wall time, usage totals, tool-call counts, integrity blocks, step durations, hashes of the tools and the prompt, error if the run crashed. |
 | `previous_runs/<timestamp>/` | Logs of earlier runs of the same workspace. |
 
 The trajectory JSON also carries `usage`, `integrity_blocks` and `step_durations_s`.

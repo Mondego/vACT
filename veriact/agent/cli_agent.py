@@ -13,6 +13,7 @@ import importlib.resources
 import inspect
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -21,6 +22,13 @@ from logging import getLogger
 from typing import Any, Dict, Generator, Optional, TypedDict
 
 import yaml
+from veriact.core.data_types import (  # shared RQ4 settings (identical for the Claude Code / Codex tools)
+    DEFAULT_MAX_STEPS,
+    HARNESS_FEEDBACK_PAIRS,
+    HARNESS_PASS_THRESHOLD,  # 0.75, as the agent_harness scaffold
+    MAX_TOOL_CALLS,
+    TOOL_TIMEOUT_S,
+)
 from jinja2 import StrictUndefined, Template
 from rich.console import Group
 from rich.text import Text
@@ -52,31 +60,19 @@ from veriact.core.utility import (
 
 logger = getLogger(__name__)
 
-try:  # same integrity check as the Spec-Harness evaluation (generated vendored copy)
-    from veriact.tools.harness_tool import JavaMethodParser, check_integrity
-except Exception:  # pragma: no cover
-    JavaMethodParser = check_integrity = None
+# The RQ4 agent tools' shared rule (identical for every agent; generated vendored copy of spec_harness):
+# a reason string if the code changes the class name, the method signature/body, any other member of the
+# class, or puts a JML `assume` inside the method body; None if the call may run (unparseable code is let
+# through, OpenJML then reports the syntax error).
+from veriact.tools.harness_tool import agent_code_violation
 
-
-def integrity_violation(original_code: str, code: str) -> Optional[str]:
-    """
-    Reason string if `code` changes the class name, the method signature, or the
-    method body of `original_code` (JML annotations and braces added around single
-    statements are allowed); None if unchanged or if either side cannot be parsed
-    (then the call is let through and OpenJML reports real syntax errors).
-    """
-    if not original_code or check_integrity is None:
-        return None
-    try:
-        parser = JavaMethodParser()
-        orig = parser.parse(original_code)
-        new = parser.parse(code, orig["method_name"])
-        r = check_integrity(original_code, code, orig, new)
-    except Exception:
-        return None
-    if r["class_renamed"] or r["signature_changed"] or r["body_modified"]:
-        return r["reason"] or "code differs from the original program"
-    return None
+CODE_MODIFIED_INSTRUCTION = (
+    "Do not change the program. Keep the class name, the method "
+    "signature, and every statement of the method body exactly as in "
+    "the original; only add JML annotations (requires/ensures/"
+    "loop_invariant/assignable/decreases). The tool was not run."
+)
+BUDGETED_TOOLS = ("verify", "run_spec_harness")   # each submitted call uses one of the MAX_TOOL_CALLS
 
 
 # Path to the tool CLI invoked as a subprocess (veriact/tools/cli.py).
@@ -127,7 +123,7 @@ class MultiStepAgent:
         tools,
         model,
         prompt_templates=None,
-        max_steps=11,
+        max_steps=DEFAULT_MAX_STEPS,
         verbosity_level=LogLevel.INFO,
         grammar=None,
         step_callbacks=None,
@@ -135,9 +131,12 @@ class MultiStepAgent:
         name=None,
         description=None,
         task_complete_checks=None,
-        harness_threshold=0.5,
+        harness_threshold=HARNESS_PASS_THRESHOLD,
+        max_tool_calls=MAX_TOOL_CALLS,
     ):
         self.agent_name = self.__class__.__name__
+        self.max_tool_calls = max_tool_calls
+        self.tool_calls_used = 0          # verify + run_spec_harness calls submitted so far
         self.model = model
         self.prompt_templates = prompt_templates or EMPTY_PROMPT_TEMPLATES
         self.max_steps = max_steps
@@ -267,7 +266,8 @@ class MultiStepAgent:
                             "type": "text",
                             "text": populate_template(
                                 self.prompt_templates["planning"]["initial_plan"],
-                                variables={"task": task, "tools": self.tools},
+                                variables={"task": task, "tools": self.tools,
+                                           "max_tool_calls": self.max_tool_calls},
                             ),
                         }
                     ],
@@ -299,7 +299,8 @@ class MultiStepAgent:
                             variables={
                                 "task": task,
                                 "tools": self.tools,
-                                "remaining_steps": self.max_steps - step,
+                                "remaining_tool_calls": max(self.max_tool_calls - self.tool_calls_used, 0),
+                                "max_tool_calls": self.max_tool_calls,
                             },
                         ),
                     }
@@ -324,6 +325,7 @@ class MultiStepAgent:
                     "tools": self.tools,
                     "task": task_value,
                     "harness_threshold": self.harness_threshold,
+                    "max_tool_calls": self.max_tool_calls,
                 },
             )
         return ""
@@ -361,6 +363,8 @@ class MultiStepAgent:
             },
             "prompt_templates": self.prompt_templates,
             "max_steps": self.max_steps,
+            "max_tool_calls": self.max_tool_calls,
+            "tool_calls_used": self.tool_calls_used,
             "planning_interval": self.planning_interval,
             "name": self.name,
             "description": self.description,
@@ -383,11 +387,12 @@ class CLIAgent(MultiStepAgent):
         task_json: str,
         openjml_path: str = "openjml",
         cli_path: str = CLI_PATH,
-        tool_timeout: int = 600,
+        tool_timeout: int = TOOL_TIMEOUT_S,
+        harness_max_pairs: int = HARNESS_FEEDBACK_PAIRS,
         prompt_templates=None,
         prompt_name: str = "veriact_cli_prompt.yaml",
         planning_interval=None,
-        harness_threshold=0.5,
+        harness_threshold=HARNESS_PASS_THRESHOLD,
         **kwargs,
     ):
         if prompt_templates is None:
@@ -406,6 +411,9 @@ class CLIAgent(MultiStepAgent):
         self.openjml_path = openjml_path
         self.cli_path = cli_path
         self.tool_timeout = tool_timeout
+        self.harness_max_pairs = harness_max_pairs
+        self.tool_timeouts = 0            # tool calls killed at tool_timeout
+        self.budget_refusals = 0          # tool calls refused because the budget was exhausted
         self._last_code: Optional[str] = None
         self._solution_path = os.path.join(workspace_dir, "Solution.java")
         # Original program, used to reject tool calls that rewrite the code.
@@ -441,22 +449,87 @@ class CLIAgent(MultiStepAgent):
 
     # ---- CLI tool execution -------------------------------------------
 
-    def _run_cli(self, cmd: list[str]) -> str:
+    # Grace period between SIGTERM (the CLI's stop handler kills its OpenJML groups) and SIGKILL.
+    KILL_GRACE_S = 10
+
+    def _kill_tool_group(self, proc: subprocess.Popen) -> None:
+        """Stop a tool CLI and everything it started. The CLI runs in its own session (group id = pid);
+        OpenJML runs in further sessions (setsid) that only the CLI's stop handler (SIGTERM) can reach,
+        so: SIGTERM the CLI's group, wait up to KILL_GRACE_S, then SIGKILL the group."""
         try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=self.tool_timeout
-            )
-            out = (proc.stdout or "").strip()
-            return out if out else (proc.stderr or "").strip()
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=self.KILL_GRACE_S)
         except subprocess.TimeoutExpired:
-            return json.dumps({"error": "tool timed out", "timeout": self.tool_timeout})
+            pass
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.communicate(timeout=self.KILL_GRACE_S)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _run_cli(self, cmd: list[str]) -> str:
+        """Run one tool CLI call; return its stdout (the JSON result), else its stderr.
+        On tool_timeout the CLI and all its OpenJML groups are killed; so they are if this process is
+        interrupted (Ctrl-C / SIGTERM turned into SystemExit by run_single) while the tool runs."""
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
+            )
         except Exception as e:  # noqa: BLE001
             return json.dumps({"error": f"tool execution failed: {e}"})
+        try:
+            stdout, stderr = proc.communicate(timeout=self.tool_timeout)
+        except subprocess.TimeoutExpired:
+            self._kill_tool_group(proc)
+            self.tool_timeouts += 1
+            return json.dumps({"error": "tool timed out", "timeout": self.tool_timeout})
+        except BaseException:
+            self._kill_tool_group(proc)
+            raise
+        out = (stdout or "").strip()
+        return out if out else (stderr or "").strip()
+
+    # ---- attempt budget (verify + run_spec_harness), as the Claude Code / Codex tools ----
+
+    def _budget_info(self) -> dict:
+        return {"attempts": self.tool_calls_used, "max_attempts": self.max_tool_calls}
+
+    def _budget_exhausted(self) -> dict:
+        used, mx = self.tool_calls_used, self.max_tool_calls
+        return {
+            "error": f"attempt budget exhausted ({used}/{mx})",
+            "action": "call task_complete with your best spec",
+            "attempts": used,
+            "max_attempts": mx,
+        }
+
+    def _with_budget(self, tool_name: str, raw: str) -> str:
+        """Add the budget to a tool result: top-level attempts/max_attempts for verify (and for errors),
+        a "_budget" object for run_spec_harness scores (the Claude Code / Codex CLI output format)."""
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            obj = None
+        if not isinstance(obj, dict):
+            obj = {"error": "tool produced no JSON result", "output": truncate_content(raw or "", 2000)}
+        if tool_name == "run_spec_harness" and "error" not in obj:
+            obj["_budget"] = self._budget_info()
+        else:
+            obj.update(self._budget_info())
+        return json.dumps(obj, indent=2)
 
     def _execute_tool(self, tool_name: str, tool_input: dict) -> tuple[str, bool, dict]:
         """Run a tool as a CLI subprocess. Returns (observation, is_complete, record)."""
         # Reject tools not provided to this agent (e.g. run_spec_harness in the
         # no-harness ablation arm) so the model is told to use an available one.
+        # Not a tool call: does not use the budget.
         if tool_name not in self.tools:
             available = ", ".join(self.tools.keys())
             obs = json.dumps(
@@ -477,26 +550,38 @@ class CLIAgent(MultiStepAgent):
                 "output": summary,
             }
 
+        if tool_name not in BUDGETED_TOOLS:
+            obs = json.dumps({"error": f"unknown tool '{tool_name}'"})
+            return obs, False, {"tool_name": tool_name, "args": tool_input, "output": obs}
+
         code = tool_input.get("jml_annotated_code", "")
-        if not code:
+        if not code:  # malformed call, never submitted to the tool: does not use the budget
             obs = json.dumps({"error": "tool_input.jml_annotated_code is required"})
             return obs, False, {"tool_name": tool_name, "args": tool_input, "output": obs}
-        # Reject code that changes the program (class, signature, or method body)
-        # before anything is written or run; Solution.java keeps the last valid code,
-        # so task_complete can never submit a rewritten program.
-        violation = integrity_violation(self._original_code, code)
+
+        # Budget: after max_tool_calls submitted calls the tools refuse (the tool is not run).
+        if self.max_tool_calls > 0 and self.tool_calls_used >= self.max_tool_calls:
+            self.budget_refusals += 1
+            obs = json.dumps(self._budget_exhausted())
+            return obs, False, {"tool_name": tool_name, "args": {"task_id": self.task_id},
+                                "output": obs, "budget_exhausted": True}
+        self.tool_calls_used += 1
+
+        # Reject code that changes the program (or assumes inside the body) before anything is written
+        # or run; the call counts. Solution.java keeps the last accepted code, so task_complete (or the
+        # step limit) can never submit a rewritten program.
+        violation = agent_code_violation(self._original_code, code)
         if violation:
             self.integrity_blocks += 1
             obs = json.dumps({
                 "error": "code_modified",
                 "detail": violation,
-                "instruction": ("Do not change the program. Keep the class name, the method "
-                                "signature, and every statement of the method body exactly as in "
-                                "the original; only add JML annotations (requires/ensures/"
-                                "loop_invariant/assignable/decreases). The tool was not run."),
+                "instruction": CODE_MODIFIED_INSTRUCTION,
+                **self._budget_info(),
             })
             return obs, False, {"tool_name": tool_name, "args": {"task_id": self.task_id},
-                                "output": obs, "integrity_blocked": True}
+                                "output": obs, "integrity_blocked": True,
+                                "attempt": self.tool_calls_used}
 
         # persist the latest code so verify/harness read the same file
         with open(self._solution_path, "w") as fh:
@@ -510,7 +595,7 @@ class CLIAgent(MultiStepAgent):
                 "--openjml", self.openjml_path,
                 "--output-dir", os.path.join(self.workspace_dir, "tmp"),
             ]
-        elif tool_name == "run_spec_harness":
+        else:  # run_spec_harness
             cmd = [
                 sys.executable, self.cli_path, "harness",
                 "--code", self._solution_path,
@@ -518,16 +603,15 @@ class CLIAgent(MultiStepAgent):
                 "--openjml", self.openjml_path,
                 "--output-dir", os.path.join(self.workspace_dir, "harness"),
                 "--run-id", f"step_{self.step_number}",
+                "--max-pairs", str(self.harness_max_pairs),
             ]
-        else:
-            obs = json.dumps({"error": f"unknown tool '{tool_name}'"})
-            return obs, False, {"tool_name": tool_name, "args": tool_input, "output": obs}
 
-        observation = self._run_cli(cmd)
+        observation = self._with_budget(tool_name, self._run_cli(cmd))
         return observation, False, {
             "tool_name": tool_name,
             "args": {"task_id": self.task_id},
             "output": observation,
+            "attempt": self.tool_calls_used,
         }
 
     # ---- one ReAct step -----------------------------------------------
@@ -604,6 +688,13 @@ class CLIAgent(MultiStepAgent):
 
     def to_dict(self):
         d = super().to_dict()
+        d.update({
+            "tool_timeout": self.tool_timeout,
+            "harness_max_pairs": self.harness_max_pairs,
+            "integrity_blocks": self.integrity_blocks,
+            "budget_refusals": self.budget_refusals,
+            "tool_timeouts": self.tool_timeouts,
+        })
         d["trajectories"] = self._generate_trajectory()
         return d
 

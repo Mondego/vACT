@@ -152,6 +152,77 @@ _HEADER_WORDS = {
 }
 
 
+def java_comments(text: str) -> list[tuple[int, int, str]]:
+    """
+    (start, end, kind) of every Java comment, kind "line" (// .. end of line, the newline excluded) or
+    "block" (/* .. */), found by a lexer that skips string, char and text-block literals, so `//` or `/*`
+    inside "..." is not a comment. An unterminated block comment runs to the end of the text.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith('"""', i):                       # text block
+            j = text.find('"""', i + 3)
+            i = n if j < 0 else j + 3
+        elif c in ('"', "'"):
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append((i, j, "line"))
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append((i, j, "block"))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def mask_comments_and_literals(text: str) -> str:
+    """`text` with every comment and string/char literal replaced by spaces (newlines kept), so offsets and
+    line numbers are unchanged and regexes / brace matching see only code."""
+    buf = list(text)
+    for s, e, _ in java_comments(text):
+        for k in range(s, e):
+            if buf[k] != "\n":
+                buf[k] = " "
+    i, n = 0, len(text)
+    comments = {s: e for s, e, _ in java_comments(text)}
+    while i < n:
+        if i in comments:
+            i = comments[i]
+            continue
+        c = text[i]
+        if c in ('"', "'"):
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            for k in range(i + 1, min(j, n)):
+                if buf[k] != "\n":
+                    buf[k] = " "
+            i = j + 1
+        else:
+            i += 1
+    return "".join(buf)
+
+
+def strip_jml_inner_comments(text: str) -> str:
+    """Inside a JML annotation: drop nested `// ..` (to end of line) and `/* .. */` comments that are not
+    inside string/char literals (OpenJML treats them as comments)."""
+    parts, last = [], 0
+    for s, e, _ in java_comments(text):
+        parts.append(text[last:s])
+        last = e
+    parts.append(text[last:])
+    return "".join(parts)
+
+
 def _strip_markers(jml_block: str) -> str:
     """Remove JML comment markers (//@, /*@, @*/, */, leading @) and join lines."""
     text = jml_block
@@ -492,12 +563,15 @@ class JavaMethodParser:
         except javalang.parser.JavaSyntaxError as e:
             raise ValueError(f"javalang parse error: {e}") from e
 
-        methods = [n for _, n in tree if isinstance(n, jtree.MethodDeclaration)]
-        wanted = method_name or ("solve" if any(m.name == "solve" for m in methods) else None)
-        for node in methods:
+        methods = [(p, n) for p, n in tree if isinstance(n, jtree.MethodDeclaration)]
+        wanted = method_name or ("solve" if any(m.name == "solve" for _, m in methods) else None)
+        for path, node in methods:
             if wanted is None or node.name == wanted:
+                # the class that declares the method (from the syntax tree, so the word "class" in a
+                # comment cannot be mistaken for the class name)
+                owners = [x for x in path if isinstance(x, jtree.ClassDeclaration)]
                 return {
-                    "class_name":  class_name,
+                    "class_name":  owners[-1].name if owners else class_name,
                     "method_name": node.name,
                     "return_type": self._jtype(node.return_type),
                     "params": [
@@ -514,7 +588,7 @@ class JavaMethodParser:
     @staticmethod
     def _ensure_class(source: str) -> tuple[str, str]:
         source = source.strip()
-        m = re.search(r'\bclass\s+(\w+)', source)
+        m = re.search(r'\bclass\s+(\w+)', mask_comments_and_literals(source))
         if m:
             return source, m.group(1)
         # Bare method — wrap in a synthetic class
@@ -818,30 +892,36 @@ class StubBuilder:
             return [f"{I}//@ assume {name} != null && {name}.equals({lit});"]
 
         # ---- other scalars ----
-        lit = self._renderer._scalar(jtype.base, value)
-        return [f"{I}//@ assume {name} == {lit};"]
+        return [f"{I}//@ assume {self._scalar_eq(name, jtype.base, value)};"]
+
+    def _scalar_eq(self, expr: str, base: str, value) -> str:
+        """`expr == literal`; a NaN value is pinned with isNaN (`x == Double.NaN` is always false, which
+        would make every stub vacuous)."""
+        if isinstance(value, float) and value != value and base in ("double", "Double", "float", "Float"):
+            return f"{'Float' if base in ('float', 'Float') else 'Double'}.isNaN({expr})"
+        return f"{expr} == {self._renderer._scalar(base, value)}"
 
     def _assume_array(self, name: str, jtype: JType,
                       value: list) -> list[str]:
-        """Element-wise assumes for 1-D / 2-D arrays."""
+        """Element-wise assumes for 1-D / 2-D arrays (a null row of a 2-D array is pinned as null)."""
         I = "        "
         lines = [f"{I}//@ assume {name} != null;",
                  f"{I}//@ assume {name}.length == {len(value)};"]
 
         if jtype.array_dims == 1:
             for i, v in enumerate(value):
-                lit = self._renderer._scalar(jtype.base, v)
-                lines.append(f"{I}//@ assume {name}[{i}] == {lit};")
+                lines.append(f"{I}//@ assume {self._scalar_eq(f'{name}[{i}]', jtype.base, v)};")
         elif jtype.array_dims >= 2:
             elem = jtype.element_type()
             for i, row in enumerate(value):
+                if row is None:
+                    lines.append(f"{I}//@ assume {name}[{i}] == null;")
+                    continue
                 lines.append(f"{I}//@ assume {name}[{i}] != null;")
                 lines.append(f"{I}//@ assume {name}[{i}].length == {len(row)};")
                 if elem.array_dims == 0:
                     for j, v in enumerate(row):
-                        lit = self._renderer._scalar(jtype.base, v)
-                        lines.append(
-                            f"{I}//@ assume {name}[{i}][{j}] == {lit};")
+                        lines.append(f"{I}//@ assume {self._scalar_eq(f'{name}[{i}][{j}]', jtype.base, v)};")
                 # deeper arrays — skip per-element (would need recursion)
         return lines
 
@@ -1183,14 +1263,19 @@ class OutputMutator:
     def __init__(self, k: int = 5):
         self.k = k
 
-    # ---- equality that treats -0.0 == 0.0 and compares nested structures ----
+    # ---- equality that treats -0.0 == 0.0 and NaN == NaN, element-wise in nested structures ----
     @staticmethod
     def _eq(a: Any, b: Any) -> bool:
+        if isinstance(a, list) and isinstance(b, list):
+            return len(a) == len(b) and all(OutputMutator._eq(x, y) for x, y in zip(a, b))
+        if isinstance(a, dict) and isinstance(b, dict):
+            return a.keys() == b.keys() and all(OutputMutator._eq(a[k], b[k]) for k in a)
         if isinstance(a, float) or isinstance(b, float):
             try:
-                return float(a) == float(b)
+                fa, fb = float(a), float(b)
             except (TypeError, ValueError):
                 return a == b
+            return fa == fb or (fa != fa and fb != fb)
         return a == b
 
     _INT_RANGE = {"int": (-2**31, 2**31 - 1), "Integer": (-2**31, 2**31 - 1),
@@ -1234,7 +1319,7 @@ class OutputMutator:
         try:
             if jtype.is_array:
                 return self._mutate_array(list(value) if value is not None else [],
-                                          jtype.base)
+                                          jtype.base, jtype.array_dims)
             if jtype.is_collection:
                 return self._mutate_collection(jtype, value)
             return self._mutate_scalar(jtype.base, value)
@@ -1251,6 +1336,8 @@ class OutputMutator:
             return self._finish([v + 1, v - 1, v + 2, v - 2, 0], v, base, fallbacks=[v - 3, v + 3, 1, -1, v // 2])
         if base in ("double", "float", "Double", "Float"):
             v = float(v)
+            if v != v:                                             # NaN: v + 1 etc. would be NaN again
+                return self._finish([0.0, 1.0, -1.0, float("inf"), float("-inf")], v)
             return self._finish([v + 1.0, v - 1.0, v * 2.0, -v, 0.0], v)
         if base == "String":
             v = "" if v is None else str(v)
@@ -1313,7 +1400,7 @@ class OutputMutator:
               [self._perturb_elem(x, -1) for x in v]]
         return self._finish(cands, v, base, fallbacks=fb)
 
-    def _mutate_array(self, v: list, base: str = "int") -> list:
+    def _mutate_array(self, v: list, base: str = "int", dims: int = 1) -> list:
         cands: list = []
         if v:
             cands.append(v[:-1])                                   # drop last
@@ -1322,6 +1409,8 @@ class OutputMutator:
             cands.append([self._perturb_elem(x) for x in v])       # perturb every element
             if isinstance(last, list) and last:
                 cands.append(v[:-1] + [last[:-1]])                 # 2-D: drop last elem of last row
+        elif dims >= 2:
+            cands.append([[]])                                     # empty 2-D -> one empty row
         else:
             cands.append([self._default_elem(base)])               # empty -> one element
         cands.append([])                                           # empty
@@ -1356,7 +1445,8 @@ def parse_openjml_output(output: str, returncode: Optional[int] = None) -> Verif
     F3: distinguish verification failures from tool/compile errors.
       FAIL    - "N warning(s)" or "N verification failure(s)"
       ERROR   - compile / tool error ("error" present, no verification report)
-      OK      - returncode 0, "verified", "0 warnings", or empty output
+      OK      - returncode 0 (when a returncode is given); without one: "verified", "0 warnings",
+                or empty output
       UNKNOWN - anything else (timeouts are mapped by the caller)
     """
     low = output.strip().lower()
@@ -1366,7 +1456,10 @@ def parse_openjml_output(output: str, returncode: Optional[int] = None) -> Verif
         return VerifyResult.FAIL
     if re.search(r'\berrors?\b', low):
         return VerifyResult.ERROR
-    if returncode == 0 or "verified" in low or "0 warnings" in low or low == "":
+    if returncode is not None:
+        # a run that did not exit normally (killed, crashed) is never a proof, whatever it printed
+        return VerifyResult.OK if returncode == 0 else VerifyResult.UNKNOWN
+    if "verified" in low or "0 warnings" in low or low == "":
         return VerifyResult.OK
     return VerifyResult.UNKNOWN
 
@@ -1396,12 +1489,15 @@ _CMT_BLOCK = re.compile(r'/\*.*?\*/', re.S)
 
 
 def strip_comments(src: str) -> str:
-    """Remove JML annotations and ordinary Java comments."""
-    src = _JML_BLOCK.sub(' ', src)
-    src = _JML_LINE.sub(' ', src)
-    src = _CMT_BLOCK.sub(' ', src)
-    src = _CMT_LINE.sub(' ', src)
-    return src
+    """Remove JML annotations and ordinary Java comments (a lexer that leaves string / char literals
+    intact, so "http://x" is not cut)."""
+    parts, last = [], 0
+    for s_, e_, _ in java_comments(src):
+        parts.append(src[last:s_])
+        parts.append(" ")
+        last = e_
+    parts.append(src[last:])
+    return "".join(parts)
 
 
 def extract_method_body(src: str, method_name: str) -> Optional[str]:
@@ -1470,11 +1566,60 @@ def _java_tokens(code: str):
         return re.sub(r"\s+", " ", code).strip()
 
 
+def _norm_node(x):
+    """A javalang node as a comparable value: positions and documentation dropped, `{ single statement }`
+    blocks collapsed (braces added to place an annotation are not a change)."""
+    if isinstance(x, jtree.BlockStatement) and x.statements and len(x.statements) == 1:
+        return _norm_node(x.statements[0])
+    if isinstance(x, jtree.Node):
+        return (type(x).__name__,
+                tuple((a, _norm_node(getattr(x, a, None))) for a in x.attrs if a != "documentation"))
+    if isinstance(x, (list, tuple)):
+        return tuple(_norm_node(y) for y in x)
+    if isinstance(x, set):
+        return tuple(sorted(str(y) for y in x))
+    return x
+
+
+def _class_members(src: str, method_name: str) -> Optional[dict]:
+    """key -> normalized node of every member of the class that declares `method_name` (other than that
+    method): methods and constructors by (name, parameter types), fields by their declarator names. None
+    if the source cannot be parsed."""
+    wrapped, _ = JavaMethodParser._ensure_class(src)
+    try:
+        tree = javalang.parse.parse(wrapped)
+    except Exception:
+        return None
+    owner = None
+    for path, node in tree:
+        if isinstance(node, jtree.MethodDeclaration) and node.name == method_name:
+            owners = [x for x in path if isinstance(x, jtree.ClassDeclaration)]
+            owner = owners[-1] if owners else None
+            break
+    if owner is None:
+        return None
+    out = {}
+    for m in owner.body:
+        if isinstance(m, (jtree.MethodDeclaration, jtree.ConstructorDeclaration)):
+            if isinstance(m, jtree.MethodDeclaration) and m.name == method_name:
+                continue
+            key = ("method", m.name, tuple(str(_norm_node(p.type)) for p in (m.parameters or [])))
+        elif isinstance(m, jtree.FieldDeclaration):
+            key = ("field", tuple(d.name for d in m.declarators))
+        else:
+            key = (type(m).__name__, getattr(m, "name", None))
+        out[key] = _norm_node(m)
+    return out
+
+
 def check_integrity(bench_src: str, llm_src: str,
                     bench_parsed: dict, llm_parsed: dict) -> dict:
     """
     F10: verify the LLM only added annotations.
-    Returns {"class_renamed", "signature_changed", "body_modified", "reason"}.
+    Returns {"class_renamed", "signature_changed", "body_modified", "members_modified", "reason"}.
+    The target method must keep its signature and body; every other member of the benchmark class
+    (helper methods, fields, constructors) must be present and unchanged (added members are allowed:
+    e.g. pure helper methods for the specification).
     """
     res = {"class_renamed": False, "signature_changed": False,
            "body_modified": False, "reason": ""}
@@ -1513,8 +1658,60 @@ def check_integrity(bench_src: str, llm_src: str,
             res["body_modified"] = True
             reasons.append("method body differs from benchmark")
 
+    b_mem = _class_members(bench_src, bench_parsed["method_name"])
+    l_mem = _class_members(llm_src, llm_parsed["method_name"])
+    res["members_modified"] = False
+    if b_mem is not None and l_mem is not None:
+        changed = [k for k in b_mem if l_mem.get(k) != b_mem[k]]
+        if changed:
+            res["members_modified"] = True
+            res["body_modified"] = True          # consumers treat any change of the program alike
+            reasons.append("other members changed: " + ", ".join(str(k[1]) for k in changed[:5]))
+
     res["reason"] = "; ".join(reasons)
     return res
+
+
+def jml_assume_in_body(src: str, method_name: str) -> bool:
+    """True if a JML `assume` annotation appears inside the body of `method_name` (it lets OpenJML verify
+    any specification; the RQ4 agent tools reject it)."""
+    code = mask_comments_and_literals(src)
+    m = re.search(r"\b" + re.escape(method_name) + r"\s*\([^)]*\)\s*(?:throws[^{]*)?\{", code)
+    if not m:
+        return False
+    depth, j = 1, m.end()
+    while j < len(code) and depth:
+        depth += {"{": 1, "}": -1}.get(code[j], 0)
+        j += 1
+    for s_, e_, _ in java_comments(src):
+        if m.end() <= s_ < j:
+            body = src[s_ + 2:e_]
+            if body.startswith("@") and re.search(r"\bassume\b", body):
+                return True
+    return False
+
+
+def agent_code_violation(original_code: str, code: str) -> Optional[str]:
+    """
+    The RQ4 agent tools' rule for a tool call (identical for every agent): a reason if `code` changes the
+    program (class name, the method's signature or body, any other member of the class) or puts a JML
+    `assume` inside the method body; None if the call may run. Code that cannot be parsed is let through
+    (OpenJML reports the syntax error).
+    """
+    if not original_code:
+        return None
+    try:
+        parser = JavaMethodParser()
+        orig = parser.parse(original_code)
+        new = parser.parse(code, orig["method_name"])
+        r = check_integrity(original_code, code, orig, new)
+    except Exception:
+        return None
+    if r["class_renamed"] or r["signature_changed"] or r["body_modified"]:
+        return r["reason"] or "code differs from the original program"
+    if jml_assume_in_body(code, orig["method_name"]):
+        return "JML `assume` inside the method body (it would make any specification verify)"
+    return None
 
 
 # ============================================================

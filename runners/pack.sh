@@ -12,17 +12,29 @@ ROOT="$(cd "$REPO/.." && pwd)"
 OUT="${1:-$ROOT/bundles}"
 COMMIT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo nogit)"
 DIRTY="$(git -C "$REPO" status --porcelain 2>/dev/null | wc -l)"
-if [ "$DIRTY" != "0" ]; then echo "NOTE: $DIRTY uncommitted change(s) are NOT in the bundle; it is built from commit $COMMIT"; fi
+if [ "$DIRTY" != "0" ] && [ "${PACK_ALLOW_DIRTY:-0}" != "1" ]; then
+  echo "ERROR: $DIRTY uncommitted/untracked change(s); the bundle is built from commit $COMMIT and would not"
+  echo "       contain them. Commit first (or PACK_ALLOW_DIRTY=1 for a throwaway test bundle):"
+  git -C "$REPO" status --porcelain | head -20
+  exit 1
+fi
 NAME="spec_harness_bundle_${COMMIT}_$(date +%Y%m%d)"
 STAGE="$(mktemp -d)/$NAME"
 mkdir -p "$STAGE" "$OUT"
 # exactly the committed tree (HEAD): no untracked or ignored files, so no secrets (config/.env) and no caches
 git -C "$REPO" archive --format=tar HEAD | tar -x -C "$STAGE"
-if find "$STAGE" -name ".env" | grep -q .; then echo "ERROR: a .env file would be packaged"; exit 1; fi
+if [ -n "$(find "$STAGE" -name '.env*' -print -quit)" ]; then echo "ERROR: a .env* file would be packaged"; exit 1; fi
 for f in sgb_v2_eval sgb_v2_feedback; do test -s "$STAGE/benchmarks/specgenbench/$f.json" || { echo "missing suite $f"; exit 1; }; done
 for f in fb_v2_eval fb_120_v2_eval fb_120_v2_feedback; do test -s "$STAGE/benchmarks/formalbench/$f.json" || { echo "missing suite $f"; exit 1; }; done
 test -s "$STAGE/runners/reference/smoke_verdicts.json" || { echo "missing runners/reference/smoke_verdicts.json (run preflight --record-reference)"; exit 1; }
 python3 "$REPO/runners/slim_rq1.py" "$ROOT/artifacts/rq1" "$STAGE/inputs/rq1"
+python3 - "$STAGE/inputs/rq1" <<'PY'
+import glob, json, os, sys
+files = glob.glob(os.path.join(sys.argv[1], "*.jsonl"))
+recs = sum(1 for f in files for l in open(f) if l.strip())
+if len(files) != 136 or recs != 14881:
+    sys.exit(f"ERROR: slim RQ1 inputs have {len(files)} files / {recs} records, expected 136 / 14881")
+PY
 # runtime dependencies = the package's own (pyproject.toml), so RQ4's VeriAct runs too
 python3 - "$REPO/pyproject.toml" > "$STAGE/requirements.txt" <<'PY'
 import re, sys

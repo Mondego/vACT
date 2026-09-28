@@ -1,88 +1,71 @@
 # Agent comparison root — {{BENCHMARK}} ({{N_TASKS}} tasks, {{MODE}})
 
-Self-contained working dirs (one per task) plus a driver and aggregator, for
-running and comparing coding agents on JML-spec synthesis. Each task dir holds the
-problem (`Solution.java`, `Test.java`, `tests/`) and the four tools as shell
-scripts (`verify.sh`, `run_specharness.sh`, `submit.sh`). The agent edits
-`Solution.java`, iterates verify → fix → score, then submits. `verify.sh` runs
-OpenJML and includes the error analysis (failure modes + repair hints) in its
-output.
+Self-contained working dirs (one per task) plus a driver, for running coding agents
+on JML-spec synthesis with the same tools, budget and integrity rule as VeriAct.
+Each task dir holds the problem (`Solution.java`) and the tools as shell scripts
+(`verify.sh`, `run_specharness.sh` [with-harness arm only], `submit.sh`). The agent
+edits `Solution.java`, iterates verify → fix (→ score), then submits.
 
 ## Layout
 
 ```
 .
-├── run_agents.py      # fan out one fresh agent session per task dir
-├── collect.py         # gather every submission.json -> comparison.{json,csv}
-├── score_all.py       # (re)score each Solution.java -> harness_scores.{json,csv}
+├── run_agents.py      # one fresh agent session per task dir (lock, retry policy, logs)
+├── audit.py           # flag forbidden agent actions -> audit.json
+├── usage_report.py    # tokens / time / tool calls -> usage_per_task.csv, usage_summary.json
 ├── aggregate.py       # pass@{0.25,0.5,0.75,1.0} + mean metrics -> aggregate.json
 ├── README.md
 ├── .venv/             # ONE shared venv (javalang) used by every task session
 └── <TASK_ID>/         # one self-contained dir per task
     ├── Solution.java  # agent edits this (add JML; class stays `Solution`)
-    ├── Test.java
-    ├── tests/case_*.json
     ├── AGENTS.md      # the prompt/instructions for the agent
-    ├── verify.sh  run_specharness.sh  submit.sh
-    └── harness/       # vendored CLI + tools (+ task.json, config.json)
+    ├── verify.sh  [run_specharness.sh]  submit.sh
+    └── harness/       # vendored CLI + tools, task.json, config.json, logs
 ```
+
+There is no `Test.java` and no `tests/`: the harness tool reads `harness/task.json`,
+which holds the first 5 feedback pairs and the feedback invalid inputs (with-harness
+arm) or no pairs and no invalid inputs at all (no-harness arm).
 
 ## Run
 
 ```bash
 # one agent over all tasks (built-in templates: claude, codex)
-python run_agents.py --agent claude --threads 4
+python run_agents.py --agent claude --threads 4 --only-missing
 
 # or a custom agent command (tokens: {agents_md} {agents_md_path} {task_dir} {task_id})
-python run_agents.py --cmd 'mytool run --prompt-file {agents_md_path}' --timeout 1200
+python run_agents.py --cmd 'mytool run --prompt-file {agents_md_path}' --timeout 1200 --only-missing
 
-# then aggregate
-python collect.py        # -> comparison.json / comparison.csv
+python audit.py          # -> audit.json
+python usage_report.py   # -> usage_per_task.csv / usage_summary.json
 ```
 
-**Ablation (no-harness root):** the agent runs with `verify` + `submit` only (no
-`run_specharness.sh`). After all agents finish, score every dir's agent-written
-`Solution.java` with the spec-harness it never had access to:
+`--only-missing` re-runs a task only if it never ran or its last session failed for
+an infrastructure reason (non-zero exit, timeout, interrupted); every re-run starts
+from a fresh state (the previous one is archived in `harness/attempt_<n>/`). A task
+whose `harness/run.lock` is held by a live session is skipped.
 
-```bash
-VERIACT_PYTHON=/path/to/python OPENJML=/path/to/openjml \
-  python score_all.py --threads 8     # -> harness_scores.json / harness_scores.csv
-```
+## Final submission
 
-This also fills in each `submission.json`'s scores, so `python collect.py`
-afterwards reflects them. (`collect.py --score-missing` does the same on the fly for
-submissions that still lack scores.)
-
-**Aggregate metrics.** For pass-rate at several thresholds plus mean metrics:
-
-```bash
-python aggregate.py     # pass@{0.25,0.5,0.75,1.0} + mean metrics -> aggregate.json
-```
-
-It reads `harness_scores.json` if present, else each `submission.json`.
-
-Compare agents by running each into its **own** out-root (scaffold once per agent,
-or copy this root), then diff the `comparison.csv` / `aggregate.json` files.
+For every agent the final submission is the code of the **last accepted**
+`verify` / `run_specharness` call (`harness/last_valid_Solution.java`; its sha256 is
+the `code_sha256` of the last `"accepted": true` line of `harness/tool_calls.jsonl`),
+or the original program if no call was accepted. `submit.sh` records it in
+`submission.json` and writes it back to `Solution.java`.
 
 ## Dependencies
 
 Only the `javalang` pip package and the `openjml` binary are needed. Scaffolding
 creates **one shared `.venv`** here at the out-root (with `javalang`); every task's
-`*.sh` scripts load it — no per-task venv, no repeated `pip install`. Resolution
-order in `_env.sh`: `$VERIACT_PYTHON` → `<out-root>/.venv` → a `python` that already
-has `javalang` → (last resort) build the shared `.venv`. Set
-`OPENJML=/path/to/openjml` if it isn't on PATH. OpenJML's JVM heap is capped via
-`OPENJML_JVM` (default `-Xmx8g`).
-
-## Success criterion
-
-A task passes when `post_correctness >= 0.75` AND `post_completeness >= 0.75`
-(recorded as `passed` in each `submission.json`). `aggregate.py` also reports
-pass-rate at 0.25 / 0.5 / 0.75 / 1.0 so you aren't tied to a single cutoff.
+`*.sh` scripts load it. Resolution order in `_env.sh`: `$VERIACT_PYTHON` →
+`<out-root>/.venv` → a `python` that already has `javalang` → (last resort) build the
+shared `.venv`. `openjml` is taken from `$OPENJML` or `PATH`. OpenJML's JVM heap is
+capped via `OPENJML_JVM` (default `-Xmx8g`).
 
 ## Attempt budget
 
 Each task allows a fixed number of tool attempts (`verify` + `run_specharness`
-calls), set at scaffold time and stored in `harness/config.json`. When exhausted,
-the tools refuse and instruct the agent to submit. Override per run with
-`AGENT_MAX_ATTEMPTS=N` (0 = unlimited). `submission.json` records `attempts` used.
+calls, including calls rejected as `code_modified`), set at scaffold time and stored
+in `harness/config.json` — the only source (no environment or command-line
+override). When exhausted, the tools refuse and instruct the agent to submit.
+`submission.json` records `attempts` used.

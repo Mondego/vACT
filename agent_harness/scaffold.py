@@ -2,11 +2,14 @@
 """Scaffold self-contained per-task working directories from a benchmark.
 
 For each selected benchmark task this creates a directory (named by ``task_id``)
-containing the reference ``Solution.java``, ``Test.java``, exactly five IO pairs
-under ``tests/``, a vendored ``harness/`` (the four-tool CLI + its dependencies),
-the four ``*.sh`` tool wrappers, and an ``AGENTS.md`` instruction file. It then
-drops parent-root helpers (``run_agents.py``, ``collect.py``, ``README.md``) so
-the whole out-root can be handed to an external coding agent.
+containing the reference ``Solution.java``, a vendored ``harness/`` (the tool CLI +
+its dependencies, ``task.json``, ``config.json``), the ``*.sh`` tool wrappers and an
+``AGENTS.md`` instruction file. No ``Test.java`` and no ``tests/`` are written: the
+harness reads ``harness/task.json``, which holds exactly the first five feedback
+pairs (+ the feedback invalid inputs) in the with-harness arm and no pairs and no
+invalid inputs at all in the no-harness arm. It then drops parent-root helpers
+(``run_agents.py``, ``audit.py``, ``usage_report.py``, ``aggregate.py``,
+``README.md``) so the whole out-root can be handed to an external coding agent.
 
 The package is self-contained: it copies everything from ``templates/`` and never
 imports ``veriact``, so it can live in its own repository.
@@ -51,9 +54,11 @@ HARNESS_FILES = [
 WRAPPER_FILES_BASE = ["verify.sh", "submit.sh"]
 HARNESS_WRAPPER = "run_specharness.sh"
 # Parent-root helpers dropped once into the out-root.
-ROOT_FILES = ["run_agents.py", "collect.py", "score_all.py", "aggregate.py", "usage_report.py"]
+# score_all.py / collect.py are not shipped: they called `cli.py --no-budget`, which no longer exists
+# (final scoring is done by runners/rq4_run.py on harness/last_valid_Solution.java).
+ROOT_FILES = ["run_agents.py", "aggregate.py", "usage_report.py", "audit.py"]
 
-MAX_PAIRS = 10                      # T5 feedback list size
+MAX_PAIRS = 5                       # feedback pairs given to the harness tool (the first 5 of the T5 list)
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +108,9 @@ def select_tasks(tasks: list[dict], args: argparse.Namespace) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def pick_pairs(task: dict, max_pairs: int = MAX_PAIRS) -> list[dict]:
-    """Exactly *max_pairs* IO pairs: test_inputs first, then generated_test_cases."""
+    """The first *max_pairs* IO pairs (test_inputs first, then generated_test_cases); with a
+    *_v2_feedback.json benchmark: the first 5 of the 10-pair T5 feedback list, the pairs VeriAct's
+    harness tool uses (max_pairs=5)."""
     pairs = list(task.get("test_inputs", []))[:max_pairs]
     if len(pairs) < max_pairs:
         need = max_pairs - len(pairs)
@@ -141,37 +148,40 @@ def scaffold_task(
     task_id = task["task_id"]
     task_dir = os.path.join(out_root, _safe_name(task_id))
     harness_dir = os.path.join(task_dir, "harness")
-    tests_dir = os.path.join(task_dir, "tests")
     os.makedirs(harness_dir, exist_ok=True)
-    os.makedirs(tests_dir, exist_ok=True)
+    for stale in ("Test.java", "tests") + (() if with_harness else (HARNESS_WRAPPER,)):          # never present (re-scaffold of an old layout)
+        path = os.path.join(task_dir, stale)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.exists(path):
+            os.remove(path)
 
-    # Source files the agent works on / reads.
+    # The only source file the agent works on.
     _write(os.path.join(task_dir, "Solution.java"), task.get("code", ""))
-    _write(os.path.join(task_dir, "Test.java"), task.get("test_code", ""))
 
-    # The feedback pairs (MAX_PAIRS; with a *_v2_feedback.json benchmark these are the T5 feedback list).
-    pairs = pick_pairs(task)
-    for i, pair in enumerate(pairs):
-        _write(
-            os.path.join(tests_dir, f"case_{i}.json"),
-            json.dumps({"input": pair["input"], "output": pair["output"]}, indent=2),
-        )
-
-    # Authoritative task record for the harness CLI: the chosen pairs as
-    # test_inputs, generated_test_cases emptied (so scoring == tests/).
-    task_record = dict(task)
-    task_record["test_inputs"] = pairs
+    # Task record for the harness CLI (harness/task.json). With the harness: the first MAX_PAIRS feedback
+    # pairs as test_inputs and the feedback invalid inputs (test_code stays: the harness needs it to read
+    # the input format). Without the harness: no pairs, no invalid inputs, no test code.
+    task_record = {k: v for k, v in task.items() if k != "v2"}
     task_record["generated_test_cases"] = []
+    if with_harness:
+        task_record["test_inputs"] = pick_pairs(task)
+        task_record["invalid_inputs"] = task.get("invalid_inputs")
+    else:
+        task_record["test_inputs"] = []
+        task_record["invalid_inputs"] = []
+        task_record["test_code"] = ""
     _write(os.path.join(harness_dir, "task.json"), json.dumps(task_record, indent=2))
 
-    # Per-task tool config (attempt budget). $AGENT_MAX_ATTEMPTS overrides at runtime.
+    # Per-task tool config: the only source of the attempt budget (no environment override).
     _write(
         os.path.join(harness_dir, "config.json"),
-        json.dumps({"max_attempts": max_attempts}, indent=2),
+        json.dumps({"max_attempts": max_attempts, "no_harness": not with_harness,
+                    "max_raw_output": 1200}, indent=2),
     )
 
-    # Vendored harness files (cli.py is always present so the harness CLI can be
-    # run offline for scoring, even in the no-harness ablation arm).
+    # Vendored harness files (harness_tool.py is also needed in the no-harness arm: cli.py takes the
+    # integrity rule, agent_code_violation, from it).
     for name in HARNESS_FILES:
         shutil.copy2(os.path.join(TEMPLATES, name), os.path.join(harness_dir, name))
 
@@ -270,7 +280,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-attempts",
         type=int,
         default=10,
-        help="attempt budget per task (verify+harness calls; 0 = unlimited; "
+        help="attempt budget per task (verify+harness calls; 0 = unlimited; written to "
+        "harness/config.json; "
         "default: 10 — matches VeriAct --max-steps 11, i.e. 10 tool calls + submit)",
     )
     p.add_argument(

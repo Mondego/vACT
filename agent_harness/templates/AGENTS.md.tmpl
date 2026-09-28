@@ -11,12 +11,18 @@ Work in a **verify → fix → score → submit** loop, using the three tools be
 ## Rules
 
 - Edit **`Solution.java`** in place. Keep the method body unchanged; only add JML
-  annotations. The class **MUST** stay named `Solution`.
+  annotations. The class **MUST** stay named `Solution`. A tool call on code that changes
+  the class name, the method signature or the method body is rejected without running the
+  tool (`"error": "code_modified"`; the attempt still counts).
+- JML `assume` statements inside the method body are not allowed (they would make any
+  specification verify); a call with such code is rejected like a modified program.
 - **You only need TWO files: this prompt and `Solution.java`.** Do **NOT** open,
-  read, or list any other file or directory — not `Test.java`, not `tests/`, not
-  `harness/`, nothing. `Solution.java` has the full method implementation — infer the
-  spec from it. Verification needs only the source, and the spec-harness reads the
-  test inputs for you. Reading anything else only wastes context.
+  read, or list any other file or directory — not `harness/`, nothing outside this
+  directory. `Solution.java` has the full method implementation — infer the spec from
+  it. Reading anything else only wastes context.
+- Check your spec only with the provided scripts: do not run `openjml`, `java`,
+  `javac` or `python` yourself, do not call `harness/cli.py` directly, and do not edit
+  any file other than `Solution.java`.
 - Run every tool from **this directory**.
 - You have a budget of **{{MAX_ATTEMPTS}}** tool attempts (`verify` + `run_specharness`
   calls combined). Each call reports `attempts`/`max_attempts`. When the budget is
@@ -28,7 +34,6 @@ Work in a **verify → fix → score → submit** loop, using the three tools be
 Run OpenJML Extended Static Checking on `Solution.java`, **with built-in error
 analysis**. Prints JSON:
 `{"verified": bool, "return_code": int, "failure_modes": [...], "repair_hints": [...], "summary": str, "raw_output": str}`
-and saves it to `harness/last_verify.json`.
 Use at every verification attempt; read `repair_hints`/`summary` to fix failures. If
 `raw_output` contains `Timeout`: STOP and **simplify** the spec before retrying —
 never resubmit a structurally identical spec after a timeout.
@@ -41,16 +46,25 @@ Evaluate spec quality on four metrics in `[0.0, 1.0]` (1.0 = perfect):
 - `pre_completeness`  — `requires` rejects invalid inputs
 
 Prints JSON: `{"{{TASK_ID}}": {post_correctness, post_completeness, pre_correctness, pre_completeness}}`.
+A metric is `null` when it cannot be measured for this task, and `note` explains why (e.g.
+`pre_completeness` is `null` when no input makes the method fail). A spec without an
+`ensures` clause scores 0 on every metric.
 Call **after** verification passes.
 
 ### `./submit.sh "summary"`
 Record your final submission (writes `submission.json` with the final code, last
-scores, and a `passed` flag). Call once you meet the success threshold.
+scores, and a `passed` flag). Call once you meet the success threshold. The submitted
+code is the code of your **last accepted tool call** (`./verify.sh` or
+`./run_specharness.sh` on a program that was not rejected); edits made after that
+call are not submitted.
+Submitting ends the task: the tools refuse every call after it.
 
 ## Workflow
 
 1. Read `Solution.java` and infer the method's behavior.
-2. Add JML to `Solution.java`.
+2. Add JML to `Solution.java`. Aim for a spec that is both **correct** (true for the
+   method) and **strong** (captures the full input/output relationship), not a
+   trivially-true one.
 3. `./verify.sh`
    - failed  → read `repair_hints`/`summary`, refine the spec, go to 3.
    - timeout → simplify the spec, go to 3.

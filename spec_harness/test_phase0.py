@@ -528,6 +528,141 @@ def test_missing_or_unparseable_method_is_integrity_failure():
                                                     "pre_correctness", "pre_completeness"))
 
 
+
+# ---------------------------------------------------------------- deep review fixes (2026-09-28)
+
+def test_jml_extraction_handles_comments_and_gaps():
+    """Trailing // comments, blank lines, plain comments and Javadoc between/inside JML annotations."""
+    from spec_harness.eval_spec import extract_jml_spec
+    cls = "public class Solution {{\n{}\n    public static int solve(int r) {{ return 2*r; }}\n}}"
+    sp = extract_jml_spec(cls.format("    //@ requires r >= 0; // radius\n    //@ ensures \\result == 2*r;"), "solve")
+    assert sp.has_requires and sp.has_ensures and sp.post_terms() and "//" not in " ".join(sp.post_terms()), sp.clauses()
+    sp = extract_jml_spec(cls.format("    //@ ensures \\result == 2*r; // twice"), "solve")
+    assert sp.clauses() == ["ensures \\result == 2*r"], sp.clauses()
+    sp = extract_jml_spec(cls.format("    //@ requires r >= 0;\n\n    // >>>INFILL<<<\n    //@ ensures \\result >= 0;"), "solve")
+    assert sp.has_requires and sp.has_ensures, sp.clauses()
+    assert "requires" not in sp.helpers                    # the JML region never leaks into the helpers
+    sp = extract_jml_spec(cls.format("    /**\n     * @requires r >= 0\n     * @ensures \\result == 2*r\n     */"), "solve")
+    assert not sp.has_ensures and not sp.has_requires       # Javadoc tags are not JML
+    sp = extract_jml_spec(cls.format("    /*@ requires r >= 0; // why\n      @ ensures \\result == 2*r;\n      @*/"), "solve")
+    assert sp.clauses() == ["requires r >= 0", "ensures \\result == 2*r"], sp.clauses()
+    sp = extract_jml_spec(cls.format('    //@ ensures \\result != 0 || "a//b".length() == 3;'), "solve")
+    assert '"a//b"' in sp.clauses()[0]                     # // inside a string literal is not a comment
+
+
+def test_class_name_from_syntax_tree_not_comment():
+    from spec_harness.harness import JavaMethodParser
+    src = "/** This class contains helpers. */\npublic class Solution {\n  public static int solve(int x) { return x; }\n}"
+    assert JavaMethodParser().parse(src, "solve")["class_name"] == "Solution"
+
+
+def test_integrity_covers_other_members_and_agent_rule_rejects_assume():
+    from spec_harness.harness import agent_code_violation
+    orig = ("public class Solution {\n  static void swap(int[] a, int i, int j) { int t = a[i]; a[i] = a[j]; a[j] = t; }\n"
+            "  public static int solve(int x) { if (x < 0) return -x; return x; }\n}")
+    spec = orig.replace("  public static int solve", "  //@ ensures \\result >= 0;\n  public static int solve")
+    assert agent_code_violation(orig, spec) is None
+    assert agent_code_violation(orig, spec.replace("a[i] = a[j];", "a[i] = 0;"))
+    assert agent_code_violation(orig, spec.replace("if (x < 0)", "//@ assume false;\n    if (x < 0)"))
+    assert agent_code_violation(orig, spec.replace("if (x < 0) return -x;", "if (x < 0) { return -x; }")) is None
+
+
+def test_output_reader_follows_test_java_layout():
+    """Size header lines, explicit separators, exact String results, null String."""
+    from spec_harness.harness import JType
+    from spec_harness.eval_spec import parse_output
+    hdr, plain = {"header": True, "sep": " "}, {"header": False, "sep": " "}
+    J = lambda b, d=0, g=None: JType(base=b, array_dims=d, generic_args=g or [])
+    assert parse_output("2 3\n1 2 3\n4 5 6", J("int", 2), hdr) == [[1, 2, 3], [4, 5, 6]]
+    assert parse_output("2 0\n\n", J("int", 2), hdr) == [[], []]
+    assert parse_output("1 2 3\n4 5 6", J("int", 2), plain) == [[1, 2, 3], [4, 5, 6]]
+    assert parse_output("a, b\nc", J("String", 2), {"header": False, "sep": ", "}) == [["a", "b"], ["c"]]
+    assert parse_output("2 2\n1 2\n3 4", J("List", 0, ["List<Integer>"]), hdr) == [[1, 2], [3, 4]]
+    assert parse_output("2\nx yo", J("HashSet", 0, ["String"]), hdr) == ["x", "yo"]
+    assert parse_output("  two  spaces ", J("String")) == "  two  spaces "
+    assert parse_output("null", J("String")) is None
+
+
+def test_input_reader_truncates_rows_like_test_java():
+    """r c header: Test.java reads exactly c tokens per row; an empty String[] line is [""] in Java."""
+    from spec_harness.harness import JType
+    from spec_harness.eval_spec import ReadOp, parse_input
+    op = ReadOp("m", JType(base="int", array_dims=2), "array_2d_rc")
+    assert parse_input("2 2\n1 2 9 9\n3 4\n", [op])["m"] == [[1, 2], [3, 4]]
+    op_sgb = ReadOp("m", JType(base="int", array_dims=2), "array_2d_rc", rows_when_no_cols=False)
+    op_fb = ReadOp("m", JType(base="int", array_dims=2), "array_2d_rc", rows_when_no_cols=True)
+    x = ReadOp("x", JType(base="int"), "scalar")
+    assert parse_input("2 0\n7\n", [op_sgb, x]) == {"m": [[], []], "x": 7}
+    assert parse_input("2 0\n\n\n7\n", [op_fb, x]) == {"m": [[], []], "x": 7}
+    s_op = ReadOp("s", JType(base="String", array_dims=1), "array_direct")
+    assert parse_input("\n", [s_op])["s"] == [""]
+
+
+def test_mutants_nan_and_empty_2d():
+    from spec_harness.harness import OutputMutator, JType
+    m = OutputMutator(k=5)
+    nan_muts = m.mutate(JType(base="double"), float("nan"))
+    assert nan_muts and all(x == x for x in nan_muts), nan_muts           # never NaN again
+    assert m.mutate(JType(base="int", array_dims=2), []) == [[[]]]
+    assert OutputMutator._eq([float("nan")], [float("nan")])
+
+
+def test_nan_and_null_row_assumptions():
+    from spec_harness.harness import StubBuilder, JType
+    b = StubBuilder()
+    assert b._scalar_eq("x", "double", float("nan")) == "Double.isNaN(x)"
+    lines = b._assume_array("m", JType(base="int", array_dims=2), [[1], None])
+    assert any("m[1] == null" in l for l in lines)
+
+
+def test_openjml_ok_needs_exit_zero():
+    from spec_harness.harness import parse_openjml_output, VerifyResult
+    assert parse_openjml_output("", 0) == VerifyResult.OK
+    assert parse_openjml_output("", -9) == VerifyResult.UNKNOWN          # killed: never a proof
+    assert parse_openjml_output("1 warning", 0) == VerifyResult.FAIL
+
+
+def test_check_errors_do_not_drop_pairs():
+    """A check that raises is an ERROR verdict (counted, excluded), the rest of the pair still runs."""
+    import json, tempfile
+    import spec_harness.eval_llm_response as ev
+    t = next(x for x in json.load(open("benchmarks/specgenbench/sgb_v2_eval.json")) if x["task_id"] == "SGB_Abs")
+    code = t["code"].replace("public static int solve", "//@ ensures \\result >= 0;\n\tpublic static int solve", 1)
+    calls = {"n": 0}
+
+    class R:
+        def __init__(self, *a, **k): pass
+        def decide(self, a, r, cname, lbl, wait_both=False):
+            calls["n"] += 1
+            if "post_correct" in lbl:
+                raise RuntimeError("boom")
+            return "reject", {"seconds": 0}
+    orig = ev.OpenJMLRunnerPersistent
+    ev.OpenJMLRunnerPersistent = R
+    try:
+        res = ev.evaluate_problem(ev.Task.from_dict(t), code, output_dir=tempfile.mkdtemp(), max_pairs=3,
+                                  exclude_collection_tasks=False)
+    finally:
+        ev.OpenJMLRunnerPersistent = orig
+    assert res["post_correctness"]["errors"] == 3 and res["check_exceptions"] >= 3, res["post_correctness"]
+    assert res["post_completeness"]["total"] > 0 and not res["pair_errors"]
+
+
+def test_vacuity_guard_only_for_helper_contracts():
+    from spec_harness.harness import MethodSpec
+    from spec_harness.eval_llm_response import helpers_have_contracts
+    assert not helpers_have_contracts(MethodSpec(jml_block="", helpers="static int f(int x) { return x; }"))
+    assert helpers_have_contracts(MethodSpec(jml_block="", helpers="//@ ensures false;\nstatic int f(int x) { return x; }"))
+
+
+def test_slots_never_below_two():
+    import spec_harness.eval_llm_response as ev
+    old = ev.JVM_SLOTS.n
+    ev.set_jvm_slots(1)
+    assert ev.JVM_SLOTS.n == 2
+    ev.set_jvm_slots(old)
+
+
 if __name__ == "__main__":
     import sys
     fails = 0

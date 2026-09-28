@@ -19,7 +19,14 @@ import time
 from datetime import datetime
 
 from veriact.agent.cli_agent import CLIAgent
-from veriact.core.data_types import HARNESS_PASS_THRESHOLD, Task
+from veriact.core.data_types import (
+    DEFAULT_MAX_STEPS,
+    HARNESS_FEEDBACK_PAIRS,
+    HARNESS_PASS_THRESHOLD,
+    MAX_TOOL_CALLS,
+    TOOL_TIMEOUT_S,
+    Task,
+)
 from veriact.core.file_utility import dump_json
 from veriact.core.memory import ActionStep
 from veriact.core.models import peek_llm_calls, start_llm_call_log, stop_llm_call_log
@@ -58,9 +65,12 @@ class VeriActAgent:
         dataset_path="",
         output_dir="veriact_outputs",
         planning_interval=5,
-        max_steps=11,
+        max_steps=DEFAULT_MAX_STEPS,
         harness_threshold=HARNESS_PASS_THRESHOLD,
         no_harness: bool = False,
+        max_tool_calls: int = MAX_TOOL_CALLS,
+        tool_timeout: int = TOOL_TIMEOUT_S,
+        harness_max_pairs: int = HARNESS_FEEDBACK_PAIRS,
         _run_dir: str | None = None,
         **kwargs,
     ):
@@ -71,6 +81,9 @@ class VeriActAgent:
         self.planning_interval = planning_interval
         self.harness_threshold = harness_threshold
         self.no_harness = no_harness
+        self.max_tool_calls = max_tool_calls
+        self.tool_timeout = tool_timeout
+        self.harness_max_pairs = harness_max_pairs
         self._kwargs = kwargs
 
         if _run_dir:
@@ -99,6 +112,7 @@ class VeriActAgent:
         return ws, task_json
 
     def run(self, task: Task) -> dict:
+        self._agent = None
         workspace, task_json = self._setup_workspace(task)
         harness_dir = os.path.join(workspace, "harness")
         # Keep earlier sessions' logs of this workspace (never overwrite).
@@ -114,7 +128,7 @@ class VeriActAgent:
         error = None
         try:
             return self._run_task(task, workspace, task_json)
-        except Exception as exc:  # noqa: BLE001
+        except BaseException as exc:  # noqa: BLE001  (also SystemExit from run_single's SIGTERM handler)
             error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
@@ -142,6 +156,7 @@ class VeriActAgent:
 
     def _write_run_meta(self, task, workspace, calls, ts_start, wall_s, error) -> None:
         harness_dir = os.path.join(workspace, "harness")
+        ag = getattr(self, "_agent", None)   # the CLIAgent of this run (None if it was never built)
 
         def sha(path):
             try:
@@ -156,9 +171,17 @@ class VeriActAgent:
             "agent": "veriact",
             "model": getattr(self.model, "model_id", None),
             "mode": "no-harness" if self.no_harness else "with-harness",
+            "reasoning_effort": getattr(self.model, "reasoning_effort", None),
+            "model_config": self._model_config(),
             "max_steps": self.max_steps,
+            "max_tool_calls": self.max_tool_calls,
+            "tool_timeout_s": self.tool_timeout,
+            "harness_max_pairs": self.harness_max_pairs,
             "planning_interval": self.planning_interval,
             "harness_threshold": self.harness_threshold,
+            "tool_calls_used": getattr(ag, "tool_calls_used", None),
+            "budget_refusals": getattr(ag, "budget_refusals", None),
+            "tool_timeouts": getattr(ag, "tool_timeouts", None),
             "host": socket.gethostname(),
             "python": sys.version.split()[0],
             "ts_start": ts_start,
@@ -167,7 +190,7 @@ class VeriActAgent:
             "error": error,
             "usage": self._usage_totals(calls),
             "tool_calls": self._tool_call_counts(harness_dir),
-            "integrity_blocks": getattr(self, "_last_integrity_blocks", None),
+            "integrity_blocks": getattr(ag, "integrity_blocks", None),
             "step_durations_s": getattr(self, "_last_step_durations", None),
             "tool_sha256": {n: sha(os.path.join(pkg, "tools", n))
                             for n in ("cli.py", "harness_tool.py", "verifier_tool.py")},
@@ -178,6 +201,14 @@ class VeriActAgent:
         with open(os.path.join(harness_dir, "run_meta.json"), "w") as fh:
             json.dump(meta, fh, indent=2, default=str)
         self._last_meta = meta
+
+    def _model_config(self) -> dict | None:
+        try:
+            d = self.model.to_dict()
+        except Exception:  # noqa: BLE001
+            return None
+        return {k: v for k, v in d.items()
+                if k not in ("last_input_token_count", "last_output_token_count", "api_key")}
 
     def _run_task(self, task, workspace, task_json) -> dict:
 
@@ -200,8 +231,12 @@ class VeriActAgent:
             planning_interval=self.planning_interval,
             harness_threshold=self.harness_threshold,
             prompt_name=prompt_name,
+            max_tool_calls=self.max_tool_calls,
+            tool_timeout=self.tool_timeout,
+            harness_max_pairs=self.harness_max_pairs,
             **self._kwargs,
         )
+        self._agent = agent  # run_meta reads the budget counters even if the run raises
 
         task_str = f"task_id: {task.task_id}\n\njava_code:\n{task.code}\n\n"
         result = agent.run(task=task_str)
@@ -222,6 +257,9 @@ class VeriActAgent:
         )
 
         self._last_integrity_blocks = getattr(agent, "integrity_blocks", None)
+        self._last_tool_calls_used = agent.tool_calls_used
+        self._last_budget_refusals = agent.budget_refusals
+        self._last_tool_timeouts = agent.tool_timeouts
         self._last_step_durations = list(getattr(getattr(agent, "monitor", None), "step_durations", []) or [])
         trajectory = {
             "task_id": task.task_id,
@@ -233,6 +271,11 @@ class VeriActAgent:
             # Filled in from the per-call log (see _write_run_meta for run_meta.json).
             "usage": self._usage_totals(peek_llm_calls()),
             "integrity_blocks": self._last_integrity_blocks,
+            "tool_calls_used": self._last_tool_calls_used,
+            "max_tool_calls": self.max_tool_calls,
+            "budget_refusals": self._last_budget_refusals,
+            "tool_timeouts": self._last_tool_timeouts,
+            "reasoning_effort": getattr(self.model, "reasoning_effort", None),
             "step_durations_s": self._last_step_durations,
             "llm_calls_log": os.path.join(workspace, "harness", "llm_calls.jsonl"),
             "tool_calls_log": os.path.join(workspace, "harness", "tool_calls.jsonl"),
@@ -260,7 +303,7 @@ class VeriActAgent:
                     continue
                 if isinstance(scores, dict):
                     for _tid, metrics in scores.items():
-                        if not isinstance(metrics, dict):
+                        if _tid.startswith("_") or not isinstance(metrics, dict):  # "_budget"
                             continue
                         pc = metrics.get("post_correctness") or 0.0        # None = not evaluable
                         pcm = metrics.get("post_completeness") or 0.0
