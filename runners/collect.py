@@ -69,6 +69,8 @@ def meets(r: dict, m: str, t: float) -> bool:
     return x != "" and float(x) >= t
 
 
+KEY = {"post_correctness": "pass", "post_completeness": "killed", "pre_correctness": "pass",
+       "pre_completeness": "rejected"}
 PAIRS = 0          # --pairs N: re-score every result from its first N evaluation pairs (0 = as scored)
 
 
@@ -154,9 +156,17 @@ def cmd_rq3(a) -> int:
         for m in METRICS:
             x = h.get(m) or {}
             row[SHORT[m]] = "" if v[m] is None else v[m]
-            row[f"{SHORT[m]}_decided"] = x.get("total", "")
-            row[f"{SHORT[m]}_unknown"] = x.get("unknowns", "")
-            row[f"{SHORT[m]}_error"] = x.get("errors", "")
+            if PAIRS and x.get("details") is not None:     # counts of the first N pairs' checks
+                from spec_harness.score_subsets import rank
+                det = [d for d in x["details"] if m == "pre_completeness"
+                       or (rank(d.get("label")) is not None and rank(d.get("label")) < PAIRS)]
+                row[f"{SHORT[m]}_decided"] = sum(1 for d in det if d.get(KEY[m]) is not None)
+                row[f"{SHORT[m]}_unknown"] = sum(1 for d in det if d.get(KEY[m]) is None and d.get("verdict") == "unknown")
+                row[f"{SHORT[m]}_error"] = sum(1 for d in det if d.get(KEY[m]) is None and d.get("verdict") == "error")
+            else:
+                row[f"{SHORT[m]}_decided"] = x.get("total", "")
+                row[f"{SHORT[m]}_unknown"] = x.get("unknowns", "")
+                row[f"{SHORT[m]}_error"] = x.get("errors", "")
         row.update(seconds=r.get("seconds", ""), host=(r.get("provenance") or {}).get("host", ""),
                    bundle=(r.get("provenance") or {}).get("bundle", ""))
         rows.append(row)
