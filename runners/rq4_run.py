@@ -538,6 +538,9 @@ def main() -> int:
         p.add_argument("--task-ids", nargs="*", default=None, help="restrict to these tasks (testing / partial reruns)")
         p.set_defaults(func=fn)
         if name == "agents":
+            p.add_argument("--sessions", type=int, default=None,
+                           help="agent sessions in parallel, in total (1-8; e.g. 4-8 for one run at a time so the "
+                                "providers' session limits are not hit); sets --parallel-runs 1 --agent-threads N")
             p.add_argument("--parallel-runs", type=int, default=3, help="runs (agent x bench) in parallel")
             p.add_argument("--agent-threads", type=int, default=2, help="tasks in parallel per run")
             p.add_argument("--task-timeout", type=int, default=10800,
@@ -558,6 +561,10 @@ def main() -> int:
             p.add_argument("--retry-errors", action="store_true", help="re-score tasks whose result is an error")
     a = ap.parse_args()
     a.out = os.path.abspath(a.out)
+    if a.cmd == "agents" and a.sessions is not None:
+        if not 1 <= a.sessions <= 8:
+            ap.error("--sessions must be between 1 and 8")
+        a.parallel_runs, a.agent_threads = 1, a.sessions
     if a.cmd == "score" and not a.workers:
         a.workers = max(1, a.jvm_slots // 2)
     return a.func(a)
