@@ -663,6 +663,22 @@ def test_slots_never_below_two():
     ev.set_jvm_slots(old)
 
 
+def test_array_inputs_pinned_elementwise():
+    """2-D (and deeper) arrays pin every element; String / boxed elements are pinned by value, not identity."""
+    from spec_harness.harness import StubBuilder, JType
+    sb = StubBuilder()
+    two = "\n".join(sb._assume_array("a", JType("int", 2), [[1, 2], [3]]))
+    assert "a[0][1] == 2;" in two and "a[1][0] == 3;" in two
+    three = "\n".join(sb._assume_array("c", JType("int", 3), [[[7]]]))
+    assert "c[0][0][0] == 7;" in three
+    strs = "\n".join(sb._assume_array("s", JType("String", 1), ["ab", None]))
+    assert 's[0] != null && s[0].equals("ab");' in strs and "s[1] == null;" in strs and 's[0] == "ab"' not in strs
+    rows = "\n".join(sb._assume_array("t", JType("String", 2), [["x"], None]))
+    assert 't[0][0] != null && t[0][0].equals("x");' in rows and "t[1] == null;" in rows
+    boxed = "\n".join(sb._assume_array("b", JType("Integer", 1), [5]))
+    assert "b[0] != null && b[0] == 5;" in boxed
+
+
 if __name__ == "__main__":
     import sys
     fails = 0

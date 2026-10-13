@@ -901,29 +901,37 @@ class StubBuilder:
             return f"{'Float' if base in ('float', 'Float') else 'Double'}.isNaN({expr})"
         return f"{expr} == {self._renderer._scalar(base, value)}"
 
+    _BOXED = {"Integer", "Long", "Short", "Byte", "Double", "Float", "Boolean", "Character"}
+
     def _assume_array(self, name: str, jtype: JType,
                       value: list) -> list[str]:
-        """Element-wise assumes for 1-D / 2-D arrays (a null row of a 2-D array is pinned as null)."""
+        """Element-wise assumes for arrays of any dimension: the array is non-null with the given length and
+        every element is pinned recursively (a null row or element is pinned as null). Elements of a
+        reference type are pinned by value: String with equals, boxed numbers by unboxing; `==` would compare
+        object identity and leave the content unconstrained."""
         I = "        "
         lines = [f"{I}//@ assume {name} != null;",
                  f"{I}//@ assume {name}.length == {len(value)};"]
-
-        if jtype.array_dims == 1:
-            for i, v in enumerate(value):
-                lines.append(f"{I}//@ assume {self._scalar_eq(f'{name}[{i}]', jtype.base, v)};")
-        elif jtype.array_dims >= 2:
-            elem = jtype.element_type()
-            for i, row in enumerate(value):
-                if row is None:
-                    lines.append(f"{I}//@ assume {name}[{i}] == null;")
-                    continue
-                lines.append(f"{I}//@ assume {name}[{i}] != null;")
-                lines.append(f"{I}//@ assume {name}[{i}].length == {len(row)};")
-                if elem.array_dims == 0:
-                    for j, v in enumerate(row):
-                        lines.append(f"{I}//@ assume {self._scalar_eq(f'{name}[{i}][{j}]', jtype.base, v)};")
-                # deeper arrays — skip per-element (would need recursion)
+        elem = jtype.element_type()
+        for i, v in enumerate(value):
+            e = f"{name}[{i}]"
+            if v is None:
+                lines.append(f"{I}//@ assume {e} == null;")
+            elif elem.is_array:
+                lines.extend(self._assume_array(e, elem, v))
+            else:
+                lines.append(f"{I}//@ assume {self._element_eq(e, elem.base, v)};")
         return lines
+
+    def _element_eq(self, expr: str, base: str, value) -> str:
+        """Pin one non-null array element to *value*, comparing by value for reference types."""
+        if base == "String":
+            return f"{expr} != null && {expr}.equals({self._renderer._scalar('String', value)})"
+        if base in self._BOXED:
+            prim = {"Integer": "int", "Long": "long", "Short": "short", "Byte": "byte", "Double": "double",
+                    "Float": "float", "Boolean": "boolean", "Character": "char"}[base]
+            return f"{expr} != null && {self._scalar_eq(expr, prim, value)}"
+        return self._scalar_eq(expr, base, value)
 
     def _assume_collection(self, name: str, jtype: JType,
                            value: Any) -> list[str]:

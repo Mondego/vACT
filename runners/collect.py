@@ -32,7 +32,15 @@ Scoring conventions (identical to the paper's definitions):
     verified in RQ1 / by the agent, no postcondition, integrity failure, undecided (unknown) checks.
     PreComp: the denominator is the tasks whose evaluation suite has invalid inputs (T-), x configurations;
     for the other tasks no input makes the reference fail, so PreComp is undefined by design (a fixed set
-    per benchmark: SGB 65, FB 523, FB-120 96). The means are over evaluable specs and are descriptive only.
+    per benchmark: SGB 65, FB 516, FB-120 96). The means are over evaluable specs and are descriptive only.
+  * suite rules applied at collect time to the frozen suite files (apply_suite_rules):
+    - T- whose recorded reference outcome is a java.lang.Error (OutOfMemoryError / StackOverflowError: resource-
+      dependent, not a property of the input; 1 SGB + 16 FB inputs that the T4c re-run kept because it timed out)
+      are not invalid inputs: their PreComp checks (labels inv_<k>) are dropped and PreComp is recomputed from
+      the remaining decided checks. A task left without T- leaves the PreComp denominator.
+    - a task whose evaluation suite has no test pairs (FB_Array3d: its driver prints a 3-D array without its
+      shape, so no output can be parsed) cannot be scored by any approach: its units are excluded from the
+      expected set and from every denominator (FB 661 tasks in RQ3), and reported.
 """
 from __future__ import annotations
 
@@ -55,13 +63,51 @@ SUITE_FILES = {"rq3": {"sgb": "specgenbench/sgb_v2_eval.json", "fb": "formalbenc
                "rq4": {"sgb": "specgenbench/sgb_v2_eval.json", "fb": "formalbench/fb_120_v2_eval.json"}}
 
 
+def load_suite(rq: str) -> dict:
+    """bench -> task_id -> evaluation suite record (the suite files the scoring used)."""
+    return {b: {t["task_id"]: t for t in json.load(open(os.path.join(C.REPO, "benchmarks", rel)))}
+            for b, rel in SUITE_FILES[rq].items()}
+
+
+def jvm_error_labels(task: dict) -> set:
+    """PreComp labels inv_<k> of T- whose recorded reference outcome is a java.lang.Error (not invalid inputs)."""
+    return {f"inv_{k}" for k, x in enumerate(task.get("invalid_inputs") or [])
+            if str(x.get("exception", "")).endswith("Error")}
+
+
+def has_tminus(task: dict) -> bool:
+    return len(task.get("invalid_inputs") or []) > len(jvm_error_labels(task))
+
+
+def scorable(task: dict) -> bool:
+    """False for a task whose evaluation suite has no test pairs (no approach can be scored on it)."""
+    return bool(task.get("test_inputs"))
+
+
 def fixed_sizes(rq: str) -> dict:
-    """bench -> (tasks, tasks with a non-empty evaluation T-), from the suite files the scoring used."""
-    out = {}
-    for b, rel in SUITE_FILES[rq].items():
-        ts = json.load(open(os.path.join(C.REPO, "benchmarks", rel)))
-        out[b] = (len(ts), sum(1 for t in ts if t.get("invalid_inputs")))
-    return out
+    """bench -> (scorable tasks, scorable tasks with a non-empty evaluation T-)."""
+    return {b: (sum(1 for t in ts.values() if scorable(t)), sum(1 for t in ts.values() if scorable(t) and has_tminus(t)))
+            for b, ts in load_suite(rq).items()}
+
+
+def apply_suite_rules(rec: dict, suite: dict) -> dict:
+    """Drop the PreComp checks of JVM-Error T- and recompute PreComp from the remaining decided checks."""
+    task = suite.get(rec.get("bench"), {}).get(rec.get("task_id"))
+    h = rec.get("harness") or {}
+    pc = h.get("pre_completeness")
+    drop = jvm_error_labels(task) if task else set()
+    if not drop or not isinstance(pc, dict) or pc.get("details") is None \
+            or h.get("integrity_failed") or h.get("no_postcondition"):
+        return rec
+    det = [d for d in pc["details"] if d.get("label") not in drop]
+    dec = [d for d in det if d.get("rejected") is not None]
+    passed = sum(1 for d in dec if d["rejected"])
+    pc = {**pc, "details": det, "passed": passed, "total": len(dec), "evaluable": bool(dec),
+          "score": passed / len(dec) if dec else None,
+          "unknowns": sum(1 for d in det if d.get("rejected") is None and d.get("verdict") == "unknown"),
+          "errors": sum(1 for d in det if d.get("rejected") is None and d.get("verdict") == "error"),
+          "dropped_jvm_error_tminus": sorted(drop)}
+    return {**rec, "harness": {**h, "pre_completeness": pc}}
 
 
 def meets(r: dict, m: str, t: float) -> bool:
@@ -159,12 +205,15 @@ def cmd_rq3(a) -> int:
     fresh_outputs(a.out, ("rq3_per_spec.csv", "rq3_fig4_cells.csv", "rq3_by_config.csv", "rq3_collect_report.json"))
     n_files = len(glob.glob(os.path.join(a.rq1_dir, "*.jsonl")))
     expected = {u["unit"]: u for u in rq3_run.units(a.rq1_dir, ["sgb", "fb"], None, 0)}
-    if n_files != 136 or len(expected) != 14881:
-        raise SystemExit(f"--rq1-dir {a.rq1_dir}: {n_files} files / {len(expected)} units, expected 136 / 14881 "
+    if n_files != 136:          # the unit count follows the RQ1 files (it changed when Daikon was re-run)
+        raise SystemExit(f"--rq1-dir {a.rq1_dir}: {n_files} files / {len(expected)} units, expected 136 files "
                          f"(point it at the RQ1 outputs, e.g. <bundle>/inputs/rq1 or artifacts/rq1)")
+    suite = load_suite("rq3")
+    unscorable = sorted(k for k, u in expected.items() if not scorable(suite[u["bench"]][u["task_id"]]))
+    expected = {k: u for k, u in expected.items() if k not in unscorable}
     seen, conflicts = merge(a.inputs, os.path.join("results", "*", "*.json"), lambda r: r["unit"], a.out)
     seen = {k: v for k, v in seen.items() if k in expected}   # unexpected units never enter a numerator
-    recs = {k: json.load(open(p)) for k, p in seen.items()}
+    recs = {k: apply_suite_rules(json.load(open(p)), suite) for k, p in seen.items()}
     check_pairs(recs)
     rows = []
     for unit in sorted(recs):
@@ -254,7 +303,7 @@ def cmd_rq3(a) -> int:
             conf.append(row)
     write_csv(os.path.join(a.out, "rq3_by_config.csv"), conf)
 
-    report = {"expected_units": len(expected), "present": len(recs),
+    report = {"expected_units": len(expected), "present": len(recs), "excluded_no_test_pairs": unscorable,
               "reused_copies": sum(1 for r in recs.values() if r.get("reused_from")),
               "missing": sorted(set(expected) - set(recs))[:200], "n_missing": len(set(expected) - set(recs)),
               "unexpected": sorted(set(recs) - set(expected))[:50],
@@ -289,11 +338,11 @@ def cmd_rq4(a) -> int:
     fresh_outputs(a.out, ("rq4_per_task.csv", "rq4_summary.csv", "rq4_collect_report.json"))
     seen, conflicts = merge(a.inputs, os.path.join("*", "_scores", "*", "*.json"),
                             lambda r: f"{r['arm']}/{r['agent']}_{r['bench']}/{r['task_id']}", a.out)
-    tasks = {b: [t["task_id"] for t in json.load(open(os.path.join(C.REPO, "benchmarks", rel)))]
-             for b, rel in SUITE_FILES["rq4"].items()}
+    suite = load_suite("rq4")
+    tasks = {b: [tid for tid, t in ts.items() if scorable(t)] for b, ts in suite.items()}
     expected = {f"{arm}/{agent}_{bench}/{tid}" for arm, agent, bench in RQ4_RUNS for tid in tasks[bench]}
     seen = {k: v for k, v in seen.items() if k in expected}
-    recs = {k: json.load(open(p)) for k, p in seen.items()}
+    recs = {k: apply_suite_rules(json.load(open(p)), suite) for k, p in seen.items()}
     check_pairs(recs)
     rows = []
     for k in sorted(recs):
