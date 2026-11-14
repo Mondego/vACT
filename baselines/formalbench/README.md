@@ -19,7 +19,7 @@
 ## Usage
 
 ```bash
-cd VeriAct
+cd vACT
 
 python -m baselines.formalbench.run \
     --name <experiment_name> \
