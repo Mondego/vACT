@@ -123,10 +123,11 @@ class Daikon:
         self._BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def _run_command_in_popen(
-        self, _command: list[str] | str, _wait_time: Optional[float] = None
+        self, _command: list[str] | str, _wait_time: Optional[float] = None, cwd: Optional[str] = None
     ) -> int:
         process = subprocess.Popen(
             _command,
+            cwd=cwd,  # per-task working directory: os.chdir would be shared by all worker threads
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -213,15 +214,14 @@ class Daikon:
     def run(self) -> DaikonResult:
         self._prepare_task_environment()
         test_count: int = len(self.test_inputs)
-        os.chdir(self.out_dir)
         command: list[str] = [
-            "./daikon.sh",
+            os.path.join(os.path.abspath(self.out_dir), "daikon.sh"),
             self.class_name,
             self.test_name,
             str(test_count),
         ]
         self.logger.info(f"Running Daikon with command: {command} for {self.run_id}")
-        exit_code: int = self._run_command_in_popen(command, self.daikon_timeout)
+        exit_code: int = self._run_command_in_popen(command, self.daikon_timeout, cwd=os.path.abspath(self.out_dir))
         if exit_code != 0:
             # Map shell exit codes to statuses
             _exit_messages: dict[int, tuple[str, str]] = {
@@ -250,7 +250,6 @@ class Daikon:
                 final_error=_msg,
             )
         self.logger.info(f"Daikon execution completed successfully for {self.run_id}")
-        os.chdir(self._BASE_DIR)  # change back to base directory after running daikon
 
         escspec_path = os.path.join(
             self.out_dir, f"{self.class_name}.java-escannotated"
@@ -296,10 +295,16 @@ class Daikon:
         )
         self.logger.info(f"Daikon run completed for task {self.run_id}")
 
-        final_error: str = jml_error_info if jml_error_info else esc_error_info
-
         esc_verified: bool = esc_returncode == 0
         jml_verified: bool = jml_returncode == 0
+
+        # final_code / final_error belong to the variant that verified (JML preferred, else ESC); if neither
+        # verified, the JML variant (or ESC if Daikon wrote no JML file) with its own error
+        if jml_verified or not esc_verified:
+            chosen_code = code_with_jmlspec if (code_with_jmlspec or not code_with_escspec) else code_with_escspec
+            final_error: str = jml_error_info if (code_with_jmlspec or not code_with_escspec) else esc_error_info
+        else:
+            chosen_code, final_error = code_with_escspec, esc_error_info
 
         # OpenJML timeout counts as timed_out, not unverified
         if "Timeout:" in final_error or "timeout" in final_error.lower():
@@ -316,7 +321,7 @@ class Daikon:
             status=status,
             esc_annotated_code=code_with_escspec,
             jml_annotated_code=code_with_jmlspec,
-            final_code=code_with_jmlspec if code_with_jmlspec else code_with_escspec,
+            final_code=chosen_code,
             esc_verified=esc_verified,
             jml_verified=jml_verified,
             timed_out=timed_out,
@@ -431,7 +436,6 @@ class DaikonRunner:
 
         finally:
             logger.info(f"Finished Daikon for {task_id} (Thread ID: {_thread_id})")
-            os.chdir(_BASE_DIR)  # change back to base directory after processing
 
     def _append_result(self, result: WorkerResult) -> None:
         """Append a single result to the JSONL file (thread-safe)."""
