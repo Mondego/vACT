@@ -271,8 +271,8 @@ python -m optimizer.prompt_optimizer \
   author       = {Md Rakib Hossain Misu and
                   Iris Ma and
                   Cristina V. Lopes},
-  title        = {VeriAct: Beyond Verifiability - Agentic Synthesis of Correct and Complete
-                  Formal Specifications},
+  title        = {Spec-Harness: Assessing and Guiding LLM-Synthesized Formal Specifications
+                  Beyond Verifiability},
   journal      = {CoRR},
   volume       = {abs/2604.00280},
   year         = {2026},
