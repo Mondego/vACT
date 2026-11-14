@@ -152,3 +152,5 @@ interpreter_workspace/
 archive/
 savedir/
 output/
+# Experiment outputs (experiments/README.md)
+results/
