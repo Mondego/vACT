@@ -13,12 +13,12 @@ For each task dir it invokes the vendored ``harness/cli.py harness --no-budget``
   * updates each dir's ``submission.json`` (scores + passed) when present, so
     ``collect.py`` reflects the post-hoc scores too.
 
-Honors ``$VERIACT_PYTHON`` / ``$OPENJML`` (or ``--python`` / ``--openjml``).
+Honors ``$VACT_PYTHON`` / ``$OPENJML`` (or ``--python`` / ``--openjml``).
 Self-contained (stdlib only); ships inside the out-root.
 
 Examples
 --------
-    VERIACT_PYTHON=/path/.venv/bin/python OPENJML=/path/openjml python score_all.py
+    VACT_PYTHON=/path/.venv/bin/python OPENJML=/path/openjml python score_all.py
     python score_all.py --threads 8 --openjml /path/openjml
 """
 
@@ -112,13 +112,13 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Score every task dir's Solution.java.")
     p.add_argument("--threads", type=int, default=4, help="parallel scorers (default: 4)")
     p.add_argument("--timeout", type=int, default=1800, help="per-task timeout seconds")
-    p.add_argument("--python", help="interpreter to run harness/cli.py (default: $VERIACT_PYTHON or 'python')")
+    p.add_argument("--python", help="interpreter to run harness/cli.py (default: $VACT_PYTHON or 'python')")
     p.add_argument("--openjml", help="OpenJML binary (default: $OPENJML)")
     p.add_argument("--out", default=os.path.join(ROOT, "harness_scores"),
                    help="output path prefix (default: ./harness_scores)")
     args = p.parse_args(argv)
 
-    python = args.python or os.environ.get("VERIACT_PYTHON", "python")
+    python = args.python or os.environ.get("VACT_PYTHON", "python")
     openjml = args.openjml or os.environ.get("OPENJML")
 
     task_dirs = find_task_dirs()

@@ -4,7 +4,7 @@
 Writes ``comparison.json`` and ``comparison.csv`` summarizing each task's four
 spec-harness scores and pass/fail. Run this after ``run_agents.py`` (or after an
 agent has solved the dirs). Run it once per agent's out-root, then diff the
-tables to compare VeriAct / Claude Code / Codex.
+tables to compare vACT / Claude Code / Codex.
 
 Self-contained (stdlib only); ships inside the out-root.
 """
@@ -26,13 +26,13 @@ THRESHOLD = 0.75
 def _score_offline(task_dir: str) -> dict | None:
     """Run the vendored harness CLI on a dir's Solution.java (ablation arm).
 
-    Honors $VERIACT_PYTHON (else 'python') and $OPENJML. Returns the metric dict
+    Honors $VACT_PYTHON (else 'python') and $OPENJML. Returns the metric dict
     or None on failure.
     """
     cli = os.path.join(task_dir, "harness", "cli.py")
     if not os.path.exists(cli):
         return None
-    python = os.environ.get("VERIACT_PYTHON", "python")
+    python = os.environ.get("VACT_PYTHON", "python")
     cmd = [python, cli, "harness", "--no-budget"]
     if os.environ.get("OPENJML"):
         cmd += ["--openjml", os.environ["OPENJML"]]
@@ -63,8 +63,8 @@ def collect(score_missing: bool = False) -> list[dict]:
             if scored:
                 scores = scored
                 data["passed"] = (
-                    scored.get("post_correctness", 0.0) >= THRESHOLD
-                    and scored.get("post_completeness", 0.0) >= THRESHOLD
+                    (scored.get("post_correctness") or 0.0) >= THRESHOLD
+                    and (scored.get("post_completeness") or 0.0) >= THRESHOLD
                 )
         row = {
             "task_id": data.get("task_id", name),
@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--score-missing", action="store_true",
                    help="score submissions lacking scores via the vendored harness "
                         "CLI (for no-harness ablation roots; honors "
-                        "$VERIACT_PYTHON / $OPENJML)")
+                        "$VACT_PYTHON / $OPENJML)")
     args = p.parse_args(argv)
 
     rows = collect(score_missing=args.score_missing)

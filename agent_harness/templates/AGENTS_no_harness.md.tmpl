@@ -11,12 +11,18 @@ shell scripts in this directory).
 ## Rules
 
 - Edit **`Solution.java`** in place. Keep the method body unchanged; only add JML
-  annotations. The class **MUST** stay named `Solution`.
+  annotations. The class **MUST** stay named `Solution`. A tool call on code that changes
+  the class name, the method signature or the method body is rejected without running the
+  tool (`"error": "code_modified"`; the attempt still counts).
+- JML `assume` statements inside the method body are not allowed (they would make any
+  specification verify); a call with such code is rejected like a modified program.
 - **You only need TWO files: this prompt and `Solution.java`.** Do **NOT** open,
-  read, or list any other file or directory — not `Test.java`, not `tests/`, not
-  `harness/`, nothing. `Solution.java` has the full method implementation — infer the
-  spec from it. Verification needs only the source. Reading anything else only wastes
-  context.
+  read, or list any other file or directory — not `harness/`, nothing outside this
+  directory. `Solution.java` has the full method implementation — infer the spec from
+  it. Reading anything else only wastes context.
+- Check your spec only with the provided scripts: do not run `openjml`, `java`,
+  `javac` or `python` yourself, do not call `harness/cli.py` directly, and do not edit
+  any file other than `Solution.java`.
 - Run every tool from **this directory**.
 - You have a budget of **{{MAX_ATTEMPTS}}** `verify` attempts. Each call reports
   `attempts`/`max_attempts`. When the budget is exhausted `verify` refuses and you
@@ -28,14 +34,16 @@ shell scripts in this directory).
 Run OpenJML Extended Static Checking on `Solution.java`, **with built-in error
 analysis**. Prints JSON:
 `{"verified": bool, "return_code": int, "failure_modes": [...], "repair_hints": [...], "summary": str, "raw_output": str}`
-and saves it to `harness/last_verify.json`.
 Use at every verification attempt; read `repair_hints`/`summary` to fix failures. If
 `raw_output` contains `Timeout`: STOP and **simplify** the spec before retrying —
 never resubmit a structurally identical spec after a timeout.
 
 ### `./submit.sh "summary"`
 Record your final submission (writes `submission.json` with the final code). Call
-once verification passes.
+once verification passes. The submitted code is the code of your **last accepted tool
+call** (`./verify.sh` on a program that was not rejected); edits made after that call
+are not submitted.
+Submitting ends the task: the tools refuse every call after it.
 
 ## Workflow
 

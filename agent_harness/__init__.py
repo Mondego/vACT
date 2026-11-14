@@ -1,4 +1,4 @@
-"""agent_harness — expose VeriAct's four tools as standalone CLIs and scaffold
+"""agent_harness — expose vACT's four tools as standalone CLIs and scaffold
 self-contained per-task working directories so external coding agents (Codex,
 Claude Code) can solve the same JML-spec-synthesis tasks with the same tools.
 
