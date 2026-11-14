@@ -1,0 +1,9 @@
+#/bin/csh -f
+
+sed -n '1,/Return the tag/p' $1.java > $1.before
+sed -n '/getTag/,$p' $1.java > $1.after
+cat $1.before
+cat manual_gettag_spec
+awk '{ print "  //@ ensures (\\result==TagConstants." $1 ") ==> \\typeof(this) <: \\type(" $2 ");" }'
+cat $1.after
+rm -f $1.before $1.after

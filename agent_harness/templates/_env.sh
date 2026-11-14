@@ -16,8 +16,8 @@ _SHARED_VENV="$_OUT_ROOT/.venv"
 
 _has_javalang() { "$1" -c 'import javalang' >/dev/null 2>&1; }
 
-if [ -n "${VERIACT_PYTHON:-}" ]; then
-  PYTHON="$VERIACT_PYTHON"
+if [ -n "${VACT_PYTHON:-}" ]; then
+  PYTHON="$VACT_PYTHON"
 elif [ -x "$_SHARED_VENV/bin/python" ]; then
   PYTHON="$_SHARED_VENV/bin/python"
 elif _has_javalang python; then

@@ -24,7 +24,7 @@ Fixed AttributeError crash when processing field declarations: replaced deferred
 ## Usage
 
 ```bash
-cd VeriAct
+cd vACT
 
 python -m baselines.autospec.run \
     --name <experiment_name> \

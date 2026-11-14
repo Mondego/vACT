@@ -4,7 +4,7 @@
 ## Usage
 
 ```bash
-cd VeriAct
+cd vACT
 
 python -m baselines.daikon.run \
     --name <experiment_name> \

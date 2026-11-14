@@ -21,7 +21,7 @@
 ## Usage
 
 ```bash
-cd VeriAct
+cd vACT
 
 python -m baselines.specgen.run \
     --name <experiment_name> \

@@ -1,7 +1,7 @@
 .PHONY: quality style test docs clean install
 
 # Define directories to check (adjust based on your project structure)
-check_dirs := specsyns
+check_dirs := spec_harness vact agent_harness baselines optimizer experiments tests
 
 # Check code quality and formatting (no changes made)
 quality:
@@ -19,7 +19,7 @@ test:
 
 # Run tests with coverage
 test-cov:
-	pytest ./tests/ --cov=specsyns --cov-report=html --cov-report=term
+	pytest ./tests/ --cov=spec_harness --cov=vact --cov-report=html --cov-report=term
 
 # Install package in editable mode with dev dependencies
 install:

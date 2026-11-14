@@ -3,9 +3,9 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "veriact"
+name = "vact"
 version = "0.0.1"
-description = "veriact"
+description = "Spec-Harness (behavioral adequacy of JML specifications) and vACT (agentic JML synthesis)"
 authors = [{ name = "MRHMisu", email = "mdrh@uci.edu" }]
 
 readme = "README.md"
@@ -25,7 +25,7 @@ dependencies = [
 
 
 [tool.setuptools.packages.find]
-include = ["config*", "baselines*", "optimizer*", "spec_harness*", "veriact*"]
+include = ["config*", "baselines*", "optimizer*", "spec_harness*", "vact*", "agent_harness*"]
 
 
 [project.optional-dependencies]
@@ -50,6 +50,8 @@ all = [
 [tool.pytest.ini_options]
 # Add the specified `OPTS` to the set of command line arguments as if they had been specified by the user.
 addopts = "-sv --durations=0"
+pythonpath = ["."]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 88 # Google style uses 88
@@ -69,12 +71,12 @@ line-ending = "auto"
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["veriact"]
+known-first-party = ["vact"]
 lines-after-imports = 2
 
 
 [tool.setuptools.package-data]
-"veriact.prompts" = ["*.yaml"]
+"vact.prompts" = ["*.yaml"]
 
 [project.scripts]
-veriact = "veriact.tools.cli:main"
+vact = "vact.tools.cli:main"

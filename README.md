@@ -1,75 +1,131 @@
-# VeriAct: Beyond Verifiability 
+# Spec-Harness and vACT: Behavioral Adequacy of LLM-Synthesized JML Specifications
 
 <div align="center">
 
-[![arXiv](https://img.shields.io/badge/arXiv-2604.01193-b31b1b.svg)](https://arxiv.org/pdf/2604.00280)
+[![arXiv](https://img.shields.io/badge/arXiv-2604.00280-b31b1b.svg)](https://arxiv.org/abs/2604.00280)
 [![License](https://img.shields.io/badge/License-GNU_GPL_v3-blue)](./LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10+-green.svg)](https://www.python.org/)
 
-### VeriAct: Beyond Verifiability -- Agentic Synthesis of Correct and Complete Formal Specifications
-Md Rakib Hossain Misu\*, Iris Ma, Cristina V. Lopes
 </div>
-
 
 ## ✨ Overview
 
-This repository contains the implementation of our paper's methodology
-> **VeriAct: Beyond Verifiability -- Agentic Synthesis of Correct and Complete Formal Specifications**
+A specification that passes a verifier is not necessarily a good one: `ensures true` verifies for every method. This repository contains tools to measure and improve how much of a program's behavior an LLM-synthesized JML specification actually captures:
+
+- **Spec-Harness** scores a specification on four metrics: the correctness and completeness of its precondition and of its postcondition. It replaces the method body with stubs that pin concrete inputs and outputs, and decides every check with an OpenJML proof.
+- **vACT** is a ReAct-style JML synthesis agent that uses the verifier results and the Spec-Harness scores as feedback.
+- **Agent tools** expose the verifier and Spec-Harness to general-purpose coding agents (Claude Code, Codex) without changing them.
+- **Baselines**: classical (Houdini, Daikon) and prompt-based (SpecGen, AutoSpec, FormalBench prompts) JML synthesis, plus a GEPA prompt optimizer.
 
 ### 💎 Key Components
 
-- **[baselines](./baselines/)** — implementation/execution scripts of classical (Daikon, Houdini) vs. prompt-based (SpecGen, AutoSpec, FormalBench) approaches.
-- **[optimizer](./optimizer/)** — uses structured OpenJML feedback to iteratively refine prompts.
-- **[spec_harness](./spec_harness/)** — evaluates correctness and completeness of verifier-accepted specifications beyond syntactic verification.
-- **[veriact](./veriact/)** — an agentic loop that combines code execution, OpenJML verification, and Spec-Harness feedback to synthesize formal specifications.
-- **[benchmarks](./benchmarks/)** — Two normalized benchmarks are used across experiments.
-
----
-For full details, see the [paper](https://arxiv.org/pdf/2604.00280).
-
+- **[spec_harness](./spec_harness/)**: the Spec-Harness metrics, stub generation and scoring.
+- **[vact](./vact/)**: the vACT agent (verifier and Spec-Harness feedback).
+- **[agent_harness](./agent_harness/)**: `verify` / `run_specharness` / `submit` tools and task scaffolding for Claude Code and Codex.
+- **[baselines](./baselines/)**: Houdini, Daikon, SpecGen, AutoSpec and the FormalBench prompts.
+- **[optimizer](./optimizer/)**: GEPA prompt optimization with OpenJML feedback.
+- **[benchmarks](./benchmarks/)**: SpecGenBench and FormalBench (normalized), and the test suites Spec-Harness scores on.
+- **[experiments](./experiments/)**: scripts that run the study (RQ1–RQ4) and collect the results.
 
 ## 🚀 Getting Started
 
 ### 💻 Prerequisites
 
-- Python >= 3.10
-- [OpenJML](https://www.openjml.org/downloads/) — must be installed and available in `PATH` as `openjml`
-- Check `openjml --version`
+- Python ≥ 3.10
+- Java 21 and [OpenJML](https://www.openjml.org/downloads/) **21-0.21**, on `PATH` as `openjml` (check with `openjml --version`)
+- For the baselines only: Java 1.6.0_21 for Houdini, and [Daikon](https://plse.cs.washington.edu/daikon/download/doc/daikon.html#Installing-Daikon) with JDK 11
+- For the agent experiments only: [Claude Code](https://docs.claude.com/en/docs/claude-code) and [Codex](https://github.com/openai/codex) CLIs
 
 ### ⏳ Install
 
 ```bash
-git clone https://github.com/Mondego/VeriAct.git
-cd VeriAct
-uv sync --all-extras
+git clone https://github.com/Mondego/vACT.git
+cd vACT
+uv sync --all-extras            # or: pip install -e ".[all,dev]"
 source .venv/bin/activate
 ```
+
 ### 🔑 API Keys
 
 Create a `.env` file in [config](./config/) with the keys for the models you intend to use:
 
 <details>
-<summary> API Keys</summary>
+<summary>API Keys</summary>
 
 ```bash
-OPENAI_API_KEY=...       # GPT-4o 
+OPENAI_API_KEY=...       # GPT models (baselines, vACT, Codex)
 ANTHROPIC_API_KEY=...    # Claude models
 GOOGLE_API_KEY=...       # Gemini models
 DEEPSEEK_API_KEY=...     # DeepSeek API
 MISTRAL_API_KEY=...      # Mistral API
-VLLM_API_KEY=...         # Local vLLM server
+VLLM_API_KEY=...         # Local vLLM server (tools/vllm/)
 VLLM_API_BASE=...        # e.g. http://localhost:8000/v1
 ```
-> **Note:** 
+
+`config/.env` is ignored by git.
 </details>
 
+### ✅ Tests
 
-### 💣  Run Command
+```bash
+python -m pytest tests/test_harness.py -q      # Spec-Harness unit tests, no OpenJML needed
+```
+
+## 💣 Usage
+
+<details>
+<summary>Run Spec-Harness on baseline outputs</summary>
+
+```bash
+python -m spec_harness.eval_llm_response \
+  --benchmark_path benchmarks/formalbench/fb_v2_eval.json \
+  --llm_response_path path/to/responses.jsonl \
+  --openjml openjml \
+  --output spec_harness_results \
+  --threads 8 \
+  --max-pairs 5 \
+  --verbose
+```
+
+`responses.jsonl` is the output of a baseline run. `--max-pairs` is the number of input/output test pairs per task. The `*_v2_eval.json` suites hold the evaluation pairs and invalid inputs (see [benchmarks/README.md](./benchmarks/README.md)).
+</details>
+
+<details>
+<summary>Run vACT</summary>
+
+```bash
+# One task at a time
+python -m vact.run.run_single \
+    --benchmark benchmarks/specgenbench/sgb_v2_feedback.json \
+    --model gpt-6.1-sol \
+    --output-dir <output_dir> \
+    --max-steps 20 \
+    --max-tool-calls 10
+
+# Tasks in parallel
+python -m vact.run.run_batch \
+    --benchmark benchmarks/specgenbench/sgb_v2_feedback.json \
+    --model gpt-6.1-sol \
+    --threads 4 \
+    --output-dir <output_dir>
+```
+
+`--no-harness` runs vACT with the verifier only. See [vact/README.md](./vact/README.md).
+</details>
+
+<details>
+<summary>Run Claude Code or Codex with the Spec-Harness tools</summary>
+
+```bash
+python -m agent_harness.scaffold \
+    --benchmark benchmarks/specgenbench/sgb_v2_feedback.json --out-root out/sgb
+```
+
+This creates one task directory per task with the tools and an instruction file. `--no-harness` leaves out the Spec-Harness tool. See [agent_harness/README.md](./agent_harness/README.md) for running the agents and collecting their results.
+</details>
 
 <details>
 <summary>Run Daikon</summary>
-
-> **Note:** Install [Daikon](https://plse.cs.washington.edu/daikon/download/doc/daikon.html#Installing-Daikon) and configure required jars in the `PATH` 
 
 ```bash
 python -m baselines.daikon.run \
@@ -82,12 +138,11 @@ python -m baselines.daikon.run \
     --verbose
 ```
 
+Daikon runs on JDK 11: set `DAIKONDIR`, and `DAIKON_JAVA` / `DAIKON_JAVAC` if JDK 11 is not the default Java.
 </details>
 
 <details>
 <summary>Run Houdini</summary>
-
-> **Note:** java version: [`1.6.0_21`](https://www.oracle.com/java/technologies/javase/6u21.html) requires to run Houdini 
 
 ```bash
 python -m baselines.houdini.run \
@@ -99,7 +154,7 @@ python -m baselines.houdini.run \
     --verbose
 ```
 
-
+Houdini needs Java [`1.6.0_21`](https://www.oracle.com/java/technologies/javase/6u21.html).
 </details>
 
 <details>
@@ -119,9 +174,8 @@ python -m baselines.specgen.run \
     --verbose
 ```
 
-> **Note:** `prompt_type`: `zero_shot` | `two_shot` | `four_shot`
+`--prompt_type`: `zero_shot` | `two_shot` | `four_shot`
 </details>
-
 
 <details>
 <summary>Run AutoSpec</summary>
@@ -137,16 +191,14 @@ python -m baselines.autospec.run \
     --max_iterations 10 \
     --openjml_timeout 300 \
     --threads 4 \
-    --verbose \
-    --simplify
+    --verbose
 ```
 
-> **Note:** `prompt_type`: `zero_shot` | `two_shot` | `four_shot`
+`--prompt_type`: `zero_shot` | `two_shot` | `four_shot`. `--simplify` turns on AutoSpec's optional simplification step (off in our experiments).
 </details>
 
-
 <details>
-<summary>Run FormalBench</summary>
+<summary>Run the FormalBench prompts</summary>
 
 ```bash
 python -m baselines.formalbench.run \
@@ -156,24 +208,24 @@ python -m baselines.formalbench.run \
     --model gpt-4o \
     --temperature 0.7 \
     --prompt_type zero_shot \
-    --max_iterations 5 \
+    --max_iterations 3 \
     --openjml_timeout 300 \
     --threads 4 \
     --verbose
 ```
 
-> **Note:** `prompt_type`: `zero_shot` | `two_shot` | `zs_cot` | `fs_cot` | `fs_ltm`
+`--prompt_type`: `zero_shot` | `two_shot` | `zs_cot` | `fs_cot` | `fs_ltm`
 </details>
 
 <details>
-<summary>Run Optimizer</summary>
+<summary>Run the prompt optimizer</summary>
 
 ```bash
 python -m optimizer.prompt_optimizer \
-    --formalbench_path <path/to/benchmarks/formalbench/fb.json> \
-    --specgenbench_path <path/to/benchmarks/specgenbench/sgb.json> \
+    --formalbench_path benchmarks/formalbench/fb.json \
+    --specgenbench_path benchmarks/specgenbench/sgb.json \
     --optimizers gepa \
-    --best_seed zero \           
+    --best_seed zero \
     --model openai/gpt-4o \
     --reflection_model openai/gpt-4o \
     --log_dir optimizer_logs \
@@ -181,79 +233,36 @@ python -m optimizer.prompt_optimizer \
     --openjml_output_dir openjml_output
 ```
 
-> **Note:** `--best_seed`: `zero` | `cot` | `ltm`
+`--best_seed`: `zero` | `cot` | `ltm`
 </details>
 
-<details>
-<summary>Run Spec-Harness</summary>
+## 🔬 Reproducing the Experiments
 
-```bash
-python -m spec_harness.eval_llm_response \
-  --benchmark_path benchmarks/formalbench/fb.json \
-  --llm_response_path path/to/responses.jsonl \
-  --openjml openjml \
-  --output spec_harness_results \
-  --threads 8 \
-  --max-pairs 5 \
-  --verbose
-```
-
-> **Note:** `responses.jsonl` is the output file of running the baselines approaches
-
-> **Note:** `--max-pairs` is the max input/output test pairs to use in mutation
-</details>
-
-<details>
-
-<summary>Run VeriAct</summary>
-
-
-```bash
-# Sequential (one task at a time)
-python -m veriact.run_single \
-    --benchmark <path/to/benchmark.json> \
-    --model gpt-4o \
-    --output-dir <output_dir> \
-    --max-steps 12 \
-    --planning_interval 3
-
-# Parallel
-python -m veriact.run_batch \
-    --benchmark <path/to/benchmark.json> \
-    --model gpt-4o \
-    --threads 4 \
-    --output-dir <output_dir> \
-    --max-steps 12 \
-    --planning_interval 3
-```
-
-> **Note:** Note
-</details>
-
+[experiments/README.md](./experiments/README.md) lists which script produces which result: the baseline runs (RQ1), prompt optimization (RQ2), Spec-Harness scoring of every verified specification (RQ3), and the agents with and without Spec-Harness feedback (RQ4). The large runs (RQ3, RQ4) use the standalone runners in [experiments/runners](./experiments/runners/), which can split the work over several machines.
 
 ## 📁 Repository Structure
 
 ```
-├── baselines               # All baselines implementation
-│   ├── houdini             # Classic, template based approach 
-│   ├── daikon              # Classic, execution trace based approach
-│   ├── specgen             # Prompt based, spec mutation 
-│   ├── autospec            # Prompt based, program decomposing and static analysis
-│   ├── formalbench         # Prompt based, advance prompting with repair guidance
-├── benchmarks              # Normalized benchamrk datasets
-│   └── specgenbench        # 120 tasks from Leetcode and JML examples
-│   ├── formalbench         # 662 tasks from FormalBench and MBJP
-├── config                  # API keys in .env file
-├── optimizer               # Prompt optimizer implementation
-├── spec_harness            # Spec-Harness implementation
-├── veriact                 # VeriAct agent implementation
-├── scripts                 # CLI run scripts for all baselines, veriact
+├── spec_harness            # Spec-Harness: metrics, stubs, scoring
+├── vact                    # vACT agent
+├── agent_harness           # Tools and task scaffolding for Claude Code and Codex
+├── baselines               # Houdini, Daikon, SpecGen, AutoSpec, FormalBench prompts
+├── optimizer               # GEPA prompt optimizer
+├── benchmarks              # Normalized benchmarks and test suites (see its README)
+│   ├── specgenbench        # 120 tasks from LeetCode and JML examples
+│   └── formalbench         # 662 tasks from FormalBench (MBJP)
+├── experiments             # Scripts that run the study (see its README)
+│   ├── scripts             # Baseline, optimizer and Spec-Harness run scripts
+│   ├── runners             # Standalone runners for Spec-Harness scoring and agents
+│   └── figures             # Figure scripts
+├── tests                   # Spec-Harness unit and smoke tests
+├── tools/vllm              # Serving the open-weight models with vLLM
+├── config                  # API keys in .env
 ├── pyproject.toml
-├── README.md
-
+└── README.md
 ```
 
-
+`agent_harness/templates/harness_tool.py` and `vact/tools/harness_tool.py` are generated from `spec_harness/` by `python agent_harness/build_harness_tool.py`. Do not edit them by hand. After changing `spec_harness/`, rebuild them, and check with `--check`.
 
 ## 📝 Citation
 
@@ -278,8 +287,9 @@ python -m veriact.run_batch \
 ```
 
 ## 📧 Contact
-If you have any questions or find any issues, please contact us at [mdrh@uci.edu](mailto:mdrh@uci.edu)
 
+If you have any questions or find any issues, please contact us at [mdrh@uci.edu](mailto:mdrh@uci.edu).
 
 ## 📄 License
-This repository is licensed under [GNU General Public License v3.0](LICENSE)
+
+This repository is licensed under the [GNU General Public License v3.0](LICENSE).

@@ -1,0 +1,9 @@
+
+Files from this directory have been moved...
+
+The astgen/astfilelist sources have been moved to Javafe/astgen.
+I did not copy the astgen test suite up there because I haven't
+used it in a long time and it's a pain to maintain...
+
+The javafe source files (e.g., hierarchy.j, Identifier.java) have
+been moved one directory up (to Javafe/java/javafe/ast).

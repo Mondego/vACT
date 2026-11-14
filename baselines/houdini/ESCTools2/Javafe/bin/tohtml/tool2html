@@ -1,0 +1,92 @@
+#!/bin/sh
+# Javafe plus HTML conversion
+# Copyright (c) 1999, Compaq Computer Corporation
+# Change history:
+#   21 Sep 1999  flanagan           Created
+#   30 Sep 1999  flanagan & rustan  Added argument checking
+#   12 Sep 2000  flanagan           Added links from varrefs to decls, etc
+#   15 Nov 2000  flanagan & freund  Moved to Javafe package from Escjava
+#   16 Feb 2001  freund             Split CLASSPATH into USERPATH and CLASSPATH
+#   06 Mar 2001  freund             Merged escjava and javafe version into javafe
+
+USAGE="Usage: TOOL_CLASSPATH=classPathWithDeclLinksAndJava2Html PATH_ARG=bootAndClassPathArgs tool2html logfile sourcedir htmldir annotation-character [programSourceFile]"
+
+if [ 4 -ne  $# ]; then
+  if [ 5 -ne  $# ]; then
+    echo $USAGE
+    exit 1
+  fi
+fi
+
+if [ "x$TOOL_CLASSPATH" = "x" ]; then
+    echo "must set TOOL_CLASSPATH for tool2html"
+    exit 1
+fi
+
+echo "PATH_ARG is ${PATH_ARG}"
+
+logfile=$1
+shift
+sourcedir=$1
+shift
+htmldir=$1
+shift
+annotationChar=$1
+shift
+
+if [ ! -e "$logfile" ]; then
+  echo "Cannot find log file $logfile"
+  echo $USAGE
+  exit 1
+fi
+if [ ! -d "$sourcedir" ]; then
+  echo "Cannot find source directory $sourcedir"
+  echo $USAGE
+  exit 1
+fi
+if [ ! -d "$htmldir" ]; then
+  echo "Cannot find HTML directory $htmldir"
+  echo $USAGE
+  exit 1
+fi
+
+linkfile=
+if [ "x$1" = "x" ]; then
+    : nothing
+else
+    echo Determining reference-to-declaration links
+
+    linkfile=tmplinks.txt
+
+    DECL_LINKS="${JAVA} -classpath ${TOOL_CLASSPATH} tohtml.DeclLinks"
+    echo "Calling: ${DECL_LINKS} ${PATH_ARG} -noCautions -f $1"
+    if ${DECL_LINKS} ${PATH_ARG} -noCautions -f $1 2>&1 >$linkfile; then
+	: nothing
+    else
+	echo "Failed to run DeclLinks for $1"
+	tail -n10 $linkfile
+	exit 1
+    fi
+fi
+
+echo Creating HTML-ized sources...
+${JAVA} -classpath ${TOOL_CLASSPATH} tohtml.Java2Html $sourcedir $htmldir  $annotationChar $linkfile
+
+echo Creating warnings file...
+${JAVAFE_ROOT}/java/tohtml/warnings2html.perl -d $htmldir <$logfile >${htmldir}/warnings.html
+
+echo Creating warnings by package files...
+echo "<html><head><title>All packages</title></head><body bgcolor=ffffdd>" > ${htmldir}/warnings-by-package.html
+echo "<b>Warnings by package</b><hr>" >> ${htmldir}/warnings-by-package.html
+for d in `find $sourcedir -type d`; do 
+  E=`echo $d | sed "s/\.\///g" | sed "s/\//\./g"`
+  if [ "$E" = "." ]; then
+    ${JAVAFE_ROOT}/java/tohtml/warnings2html.perl -d $htmldir -p $d <$logfile >${htmldir}/warnings-default-package.html
+    echo "<a href=$htmldir/warnings-default-package.html><b>all packages</b></a><br>" >> ${htmldir}/warnings-by-package.html
+  else
+    ${JAVAFE_ROOT}/java/tohtml/warnings2html.perl -d $htmldir -p $d <$logfile >${htmldir}/warnings-$E.html
+    echo "<a href=$htmldir/warnings-$E.html><b>$E</b></a><br>" >> ${htmldir}/warnings-by-package.html
+  fi
+done
+echo "</body></html>" >> ${htmldir}/warnings-by-package.html
+
