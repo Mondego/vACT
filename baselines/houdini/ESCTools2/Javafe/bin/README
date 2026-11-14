@@ -1,0 +1,11 @@
+This directory (Utils) contains utility software that was not shipped 
+with the Esctools but was created to be used in conjunction with it. -- DRCok
+
+The accompanying Makefile builds and cleans these subsystems.
+There are as yet no tests or documentation for them. (FIXME)
+
+junitutils - a set of classes that is used in junit tests of the Esctools;
+	it is not needed to run escjava itself.
+	(package junitutils); needs junit.jar
+
+junit.jar - a copy of the JUnit library (version 3.8.1)

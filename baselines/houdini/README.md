@@ -26,7 +26,7 @@
 
 ```bash
 
-cd VeriAct
+cd vACT
 
 python -m baselines.houdini.run \
     --name <experiment_name> \
