@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate a VeriAct run: pass@{0.25,0.5,0.75,1.0} + mean spec-harness metrics.
+"""Aggregate a vACT run: pass@{0.25,0.5,0.75,1.0} + mean spec-harness metrics.
 
 Reads per-task scores from (in priority):
   1. <run-dir>/harness_scores.json   (written by run.score_no_harness — used for
@@ -11,7 +11,7 @@ pass@T = fraction of tasks with post_correctness >= T AND post_completeness >= T
 Writes <run-dir>/aggregate.json and prints a summary.
 
 Usage:
-    python -m veriact.run.aggregate --run-dir out/veriact__gpt-4o__<timestamp>
+    python -m vact.run.aggregate --run-dir out/vact__gpt-4o__<timestamp>
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ def aggregate(rows: list[dict]) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="pass@{0.25,0.5,0.75,1.0} + mean metrics.")
-    p.add_argument("--run-dir", required=True, help="a veriact run dir")
+    p.add_argument("--run-dir", required=True, help="a vact run dir")
     p.add_argument("--out", default=None, help="output json (default: <run-dir>/aggregate.json)")
     args = p.parse_args(argv)
 

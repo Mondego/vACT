@@ -1,6 +1,6 @@
-"""Tool base class for agent tool definitions (trimmed for veriact).
+"""Tool base class for agent tool definitions (trimmed for vact).
 
-Only what veriact needs: attribute/signature validation and a callable
+Only what vact needs: attribute/signature validation and a callable
 interface. The original ``to_dict``/``save``/``from_code`` serialization helpers
 (which pulled in extra type-hint/AST utilities) are omitted.
 """
@@ -10,8 +10,8 @@ import logging
 from functools import wraps
 from typing import Dict, Union
 
-from veriact.core.agent_types import handle_agent_input_types, handle_agent_output_types
-from veriact.core.utility import is_valid_name
+from vact.core.agent_types import handle_agent_input_types, handle_agent_output_types
+from vact.core.utility import is_valid_name
 
 logger = logging.getLogger(__name__)
 

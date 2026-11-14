@@ -1,18 +1,37 @@
+import atexit
 import logging
 import os
 import re
 import signal
 import subprocess
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-logger = logging.getLogger("veriact_verifier_tool")
+logger = logging.getLogger("vact_verifier_tool")
 
 # Cap OpenJML's JVM heap (its default max heap is ~1/4 of RAM). Overridable via env.
 os.environ.setdefault("OPENJML_JVM", "-Xmx8g")
 
+# OpenJML runs in its own session (setsid) so a timeout kills its whole tree; such groups do not get the
+# caller's Ctrl-C / kill, so live ones are tracked and killed on exit (and by a runner's stop handler).
+_LIVE_GROUPS: set[int] = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def kill_live_groups() -> None:
+    with _LIVE_LOCK:
+        groups = list(_LIVE_GROUPS)
+    for g in groups:
+        try:
+            os.killpg(g, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+atexit.register(kill_live_groups)
 
 
 # TASK SCHEMA
@@ -146,12 +165,12 @@ def write_to_file(content: str, filepath: str) -> None:
 def verify_with_openjml(
     code_with_spec: str,
     classname: str,
-    timeout: int = 180,
-    output_dir: str = "veriact_outputs/tmp",
+    timeout: int = 300,
+    output_dir: str = "vact_outputs/tmp",
 ) -> VerificationResult:
 
     run_id = uuid.uuid4().hex
-    output_dir = os.path.join(output_dir, f"veriact_{run_id}")
+    output_dir = os.path.join(output_dir, f"vact_{run_id}")
     os.makedirs(output_dir, exist_ok=True)
 
     tmp_filename = os.path.join(output_dir, f"{classname}.java")
@@ -169,13 +188,15 @@ def verify_with_openjml(
         tmp_filename,
     ]
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        preexec_fn=os.setsid,
-    )
+    with _LIVE_LOCK:                  # launch and registration are atomic w.r.t. kill_live_groups
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            preexec_fn=os.setsid,
+        )
+        _LIVE_GROUPS.add(proc.pid)
 
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
@@ -194,9 +215,11 @@ def verify_with_openjml(
         return return_verification_result(raw_output, return_code)
     finally:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except ProcessLookupError:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
             pass
+        with _LIVE_LOCK:
+            _LIVE_GROUPS.discard(proc.pid)
 
 
 def return_verification_result(raw_output: str, return_code: int) -> VerificationResult:

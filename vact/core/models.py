@@ -1,9 +1,12 @@
 """LLM model abstractions: base Model, ApiModel, and backends (OpenAI, Anthropic, Gemini, vLLM)."""
 
+import datetime
 import json
 import logging
 import os
 import re
+import threading
+import time
 import uuid
 import warnings
 from collections.abc import Generator
@@ -12,8 +15,8 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any
 
-from veriact.tools.base import Tool
-from veriact.core.utility import _is_package_available, encode_image_base64, make_image_url, parse_json_blob
+from vact.tools.base import Tool
+from vact.core.utility import _is_package_available, encode_image_base64, make_image_url, parse_json_blob
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,8 @@ class ChatMessage:
     content: str | None = None
     tool_calls: list[ChatMessageToolCall] | None = None
     raw: Any | None = None
+    usage: dict | None = None          # normalized token usage of the call that produced it
+    latency_s: float | None = None     # wall time of that call
 
     def model_dump_json(self):
         return json.dumps(get_dict_from_nested_dataclasses(self, ignore_key="raw"))
@@ -163,6 +168,110 @@ def supports_stop_parameter(model_id: str) -> bool:
 
 
 
+# ---------------------------------------------------------------------------
+# Per-call LLM logging (thread-local: one model object is shared by parallel tasks)
+# ---------------------------------------------------------------------------
+
+_TLS = threading.local()
+
+
+def start_llm_call_log(path: str | None) -> None:
+    """Record every model call made by THIS thread (and append it to `path`)."""
+    _TLS.log_path = path
+    _TLS.calls = []
+    _TLS.last_usage = None
+
+
+def stop_llm_call_log() -> list[dict]:
+    """Stop recording for this thread; return the records collected."""
+    calls = list(getattr(_TLS, "calls", []) or [])
+    _TLS.log_path = None
+    _TLS.calls = []
+    return calls
+
+
+def peek_llm_calls() -> list[dict]:
+    """Records collected so far by this thread (recording continues)."""
+    return list(getattr(_TLS, "calls", []) or [])
+
+
+def thread_last_usage() -> dict | None:
+    """Usage of the most recent call made by this thread."""
+    return getattr(_TLS, "last_usage", None)
+
+
+def _as_dict(obj) -> dict | None:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj
+    for meth in ("model_dump", "to_dict", "to_json_dict"):
+        fn = getattr(obj, meth, None)
+        if callable(fn):
+            try:
+                d = fn()
+                if isinstance(d, dict):
+                    return d
+            except Exception:  # noqa: BLE001
+                pass
+    out = {}
+    for k in dir(obj):
+        if k.startswith("_"):
+            continue
+        try:
+            v = getattr(obj, k)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(v, (int, float, str, dict, type(None))):
+            out[k] = v
+    return out
+
+
+def usage_from_raw(raw) -> dict:
+    """
+    Normalize token usage from any backend response:
+      input_tokens (incl. cached), cached_input_tokens, cache_creation_input_tokens,
+      output_tokens, reasoning_tokens, total_tokens, plus the provider's raw usage.
+    """
+    if raw is None:
+        return {}
+    u = _as_dict(getattr(raw, "usage", None)) or _as_dict(getattr(raw, "usage_metadata", None)) or {}
+
+    def g(d, *path):
+        for p in path:
+            if not isinstance(d, dict):
+                return None
+            d = d.get(p)
+        return d
+
+    if "prompt_tokens" in u:                                   # OpenAI / vLLM
+        inp, out = u.get("prompt_tokens") or 0, u.get("completion_tokens") or 0
+        cached = g(u, "prompt_tokens_details", "cached_tokens") or 0
+        reasoning = g(u, "completion_tokens_details", "reasoning_tokens") or 0
+        creation, total = 0, u.get("total_tokens") or inp + out
+    elif "input_tokens" in u:                                  # Anthropic
+        cached = u.get("cache_read_input_tokens") or 0
+        creation = u.get("cache_creation_input_tokens") or 0
+        inp = (u.get("input_tokens") or 0) + cached + creation
+        out, reasoning = u.get("output_tokens") or 0, 0
+        total = inp + out
+    elif "prompt_token_count" in u:                            # Gemini
+        inp, out = u.get("prompt_token_count") or 0, u.get("candidates_token_count") or 0
+        cached, creation = u.get("cached_content_token_count") or 0, 0
+        reasoning = u.get("thoughts_token_count") or 0
+        total = u.get("total_token_count") or inp + out + reasoning
+    else:
+        return {"raw": u}
+    return {"input_tokens": inp, "cached_input_tokens": cached, "cache_creation_input_tokens": creation,
+            "output_tokens": out, "reasoning_tokens": reasoning, "total_tokens": total, "raw": u}
+
+
+def _jsonable(o):
+    if isinstance(o, Enum):
+        return o.value
+    return str(o)
+
+
 # Base Model
 class Model:
     def __init__(self, flatten_messages_as_text=False, tool_name_key="name", tool_arguments_key="arguments", model_id=None, **kwargs):
@@ -195,7 +304,52 @@ class Model:
         raise NotImplementedError
 
     def __call__(self, *args, **kwargs):
-        return self.generate(*args, **kwargs)
+        """Generate, and record the call (request, response, usage, latency) per thread."""
+        messages = args[0] if args else kwargs.get("messages")
+        ts_start = datetime.datetime.now().isoformat(timespec="milliseconds")
+        t0 = time.time()
+        msg, err = None, None
+        _TLS.last_request_params = None      # set by generate() to the non-message request kwargs it sent
+        try:
+            msg = self.generate(*args, **kwargs)
+            return msg
+        except Exception as exc:  # noqa: BLE001  (recorded, then re-raised)
+            err = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            latency = round(time.time() - t0, 3)
+            raw = getattr(msg, "raw", None) if msg is not None else None
+            usage = usage_from_raw(raw)
+            if msg is not None:
+                msg.usage, msg.latency_s = usage, latency
+            _TLS.last_usage = usage
+            if getattr(_TLS, "calls", None) is not None or getattr(_TLS, "log_path", None):
+                record = {
+                    "call_index": len(getattr(_TLS, "calls", []) or []),
+                    "ts_start": ts_start,
+                    "latency_s": latency,
+                    "model_id": self.model_id,
+                    "reasoning_effort": getattr(self, "reasoning_effort", None),
+                    # the request kwargs actually sent to the API, except the messages (logged separately)
+                    "request_params": getattr(_TLS, "last_request_params", None),
+                    "stop_sequences": kwargs.get("stop_sequences"),
+                    "request_messages": messages,
+                    "response_content": getattr(msg, "content", None) if msg is not None else None,
+                    "response_id": getattr(raw, "id", None),
+                    "response_model": getattr(raw, "model", None),
+                    "usage": usage,
+                    "error": err,
+                }
+                if not hasattr(_TLS, "calls") or _TLS.calls is None:
+                    _TLS.calls = []
+                _TLS.calls.append({k: v for k, v in record.items() if k != "request_messages"})
+                path = getattr(_TLS, "log_path", None)
+                if path:
+                    try:
+                        with open(path, "a") as fh:
+                            fh.write(json.dumps(record, default=_jsonable) + "\n")
+                    except Exception:  # noqa: BLE001  (logging must not break the agent)
+                        pass
 
     def parse_tool_calls(self, message: ChatMessage) -> ChatMessage:
         message.role = MessageRole.ASSISTANT
@@ -208,7 +362,8 @@ class Model:
 
     def to_dict(self) -> dict:
         d = {**self.kwargs, "last_input_token_count": self.last_input_token_count, "last_output_token_count": self.last_output_token_count, "model_id": self.model_id}
-        for attr in ["custom_role_conversion", "temperature", "max_tokens", "provider", "timeout", "api_base"]:
+        for attr in ["custom_role_conversion", "temperature", "max_tokens", "provider", "timeout", "api_base",
+                     "reasoning_effort"]:
             if hasattr(self, attr):
                 d[attr] = getattr(self, attr)
         return d
@@ -235,16 +390,30 @@ class ApiModel(Model):
 # OpenAI (also used as base for vLLM)
 
 class OpenAIServerModel(ApiModel):
-    def __init__(self, model_id: str, api_base=None, api_key=None, organization=None, project=None, client_kwargs=None, custom_role_conversions=None, flatten_messages_as_text=False, **kwargs):
+    """OpenAI chat.completions backend.
+
+    reasoning_effort: sent as the `reasoning_effort` request parameter on every call when not None
+    (e.g. "medium", the effort Codex runs it at in RQ4).
+    """
+
+    def __init__(self, model_id: str, api_base=None, api_key=None, organization=None, project=None, client_kwargs=None, custom_role_conversions=None, flatten_messages_as_text=False, reasoning_effort: str | None = None, **kwargs):
         self.client_kwargs = {**(client_kwargs or {}), "api_key": api_key, "base_url": api_base, "organization": organization, "project": project}
+        self.reasoning_effort = reasoning_effort
         super().__init__(model_id=model_id, custom_role_conversions=custom_role_conversions, flatten_messages_as_text=flatten_messages_as_text, **kwargs)
 
     def create_client(self):
         import openai
         return openai.OpenAI(**self.client_kwargs)
 
+    def build_request_kwargs(self, messages, stop_sequences=None, grammar=None, tools_to_call_from=None, **kwargs) -> dict:
+        """The exact kwargs passed to client.chat.completions.create (no API call)."""
+        if self.reasoning_effort is not None:
+            kwargs.setdefault("reasoning_effort", self.reasoning_effort)
+        return self._prepare_completion_kwargs(messages=messages, stop_sequences=stop_sequences, grammar=grammar, tools_to_call_from=tools_to_call_from, model=self.model_id, custom_role_conversions=self.custom_role_conversions, **kwargs)
+
     def generate(self, messages, stop_sequences=None, grammar=None, tools_to_call_from=None, **kwargs) -> ChatMessage:
-        ckw = self._prepare_completion_kwargs(messages=messages, stop_sequences=stop_sequences, grammar=grammar, tools_to_call_from=tools_to_call_from, model=self.model_id, custom_role_conversions=self.custom_role_conversions, **kwargs)
+        ckw = self.build_request_kwargs(messages, stop_sequences=stop_sequences, grammar=grammar, tools_to_call_from=tools_to_call_from, **kwargs)
+        _TLS.last_request_params = {k: v for k, v in ckw.items() if k != "messages"}
         response = self.client.chat.completions.create(**ckw)
         self.last_input_token_count = response.usage.prompt_tokens
         self.last_output_token_count = response.usage.completion_tokens

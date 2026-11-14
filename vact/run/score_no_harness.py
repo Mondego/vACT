@@ -9,8 +9,8 @@ and writes a consolidated score table — so the no-harness arm can be compared 
 the harness arm on identical metrics.
 
 Usage:
-    python -m veriact.run.score_no_harness \
-        --run-dir out/veriact__gpt-4o__YYYYmmdd_HHMMSS \
+    python -m vact.run.score_no_harness \
+        --run-dir out/vact__gpt-4o__YYYYmmdd_HHMMSS \
         --openjml openjml --threads 4
 """
 
@@ -23,9 +23,9 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from veriact.core.data_types import HARNESS_PASS_THRESHOLD
-from veriact.tools.harness_tool import Task, evaluate_problem
-from veriact.tools.verifier_tool import verify_with_openjml
+from vact.core.data_types import HARNESS_PASS_THRESHOLD
+from vact.tools.harness_tool import Task, evaluate_problem
+from vact.tools.verifier_tool import verify_with_openjml
 
 METRICS = ["post_correctness", "post_completeness", "pre_correctness", "pre_completeness"]
 
@@ -91,8 +91,8 @@ def score_workspace(ws: str, openjml: str, max_pairs: int, threshold: float) -> 
     for m in METRICS:
         row[m] = scores.get(m, 0.0)
     row["passed"] = (
-        scores.get("post_correctness", 0.0) >= threshold
-        and scores.get("post_completeness", 0.0) >= threshold
+        (scores.get("post_correctness") or 0.0) >= threshold          # None = not evaluable
+        and (scores.get("post_completeness") or 0.0) >= threshold
     )
     return row
 

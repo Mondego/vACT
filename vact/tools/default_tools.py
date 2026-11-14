@@ -1,6 +1,6 @@
 """Default agent tools (TaskCompletionTool)."""
 
-from veriact.tools.base import Tool
+from vact.tools.base import Tool
 
 
 class TaskCompletionTool(Tool):

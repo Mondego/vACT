@@ -1,12 +1,12 @@
 """
-batch_usage.py — Run VeriAct agents in parallel across a benchmark dataset.
+batch_usage.py — Run vACT agents in parallel across a benchmark dataset.
 
 Usage:
     python run_batch.py \
         --benchmark benchmarks/specgenbench/sgb.json \
         --threads 4 \
         --model gpt-4o \
-        --output-dir veriact_outputs \
+        --output-dir vact_outputs \
         --openjml-path openjml \
         --max-steps 11 \
         --planning_interval 3
@@ -21,16 +21,16 @@ import traceback
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from veriact import (
+from vact import (
     AnthropicModel,
     GeminiModel,
     OpenAIServerModel,
-    VeriActAgent,
+    vACTAgent,
     VLLMModel,
 )
-from veriact.core.data_types import Task
-from veriact.core.file_utility import dump_json, load_json, load_jsonl
-import veriact.config
+from vact.core.data_types import Task
+from vact.core.file_utility import dump_json, load_json, load_jsonl
+import vact.config
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +88,8 @@ def run_single_task(
     planning_interval: int,
     no_harness: bool = False,
 ) -> dict:
-    """Run a fresh VeriActAgent for a single task, sharing the same run directory."""
-    agent = VeriActAgent(
+    """Run a fresh vACTAgent for a single task, sharing the same run directory."""
+    agent = vACTAgent(
         model=model,
         openjml_path=openjml_path,
         dataset_path=dataset_path,
@@ -112,11 +112,11 @@ def append_trajectory_jsonl(trajectory: dict, filepath: str) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run VeriAct in batch mode.")
+    parser = argparse.ArgumentParser(description="Run vACT in batch mode.")
     parser.add_argument("--benchmark", required=True, help="Path to benchmark dataset (.json or .jsonl)")
     parser.add_argument("--threads", type=int, default=4, help="Number of parallel workers (default: 4)")
     parser.add_argument("--model", default="gpt-4o", help="Model ID (default: gpt-4o)")
-    parser.add_argument("--output-dir", default="veriact_outputs", help="Output directory (default: veriact_outputs)")
+    parser.add_argument("--output-dir", default="vact_outputs", help="Output directory (default: vact_outputs)")
     parser.add_argument("--openjml-path", default="openjml", help="Path to OpenJML binary (default: openjml)")
     parser.add_argument("--max-steps", type=int, default=11, help="Max agent steps per task (default: 11 = 10 tool calls + submit, matching agent_harness --max-attempts 10)")
     parser.add_argument("--planning_interval", type=int, default=5, help="Planning interval (default: 5)")
@@ -145,7 +145,7 @@ def main():
     model_id = getattr(model, "model_id", "unknown") or "unknown"
     safe_model_id = model_id.replace("/", "_")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(args.output_dir, f"veriact__{safe_model_id}__{timestamp}")
+    run_dir = os.path.join(args.output_dir, f"vact__{safe_model_id}__{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
     logger.info(f"Output directory: {run_dir}")
 

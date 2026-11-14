@@ -9,9 +9,12 @@ system_prompt: |-
 
   {"thought": "your reasoning", "tool": "<tool name>", "tool_input": { ... }}
 
-  - "tool" must be one of: verify, run_spec_harness, task_complete.
-  - Provide the COMPLETE annotated Java source in tool_input each time you call verify or run_spec_harness.
+  - "tool" must be one of: verify, task_complete.
+  - Provide the COMPLETE annotated Java source in tool_input each time you call verify.
   - The class MUST be named Solution.
+  - Do NOT change the program: keep the class name, the method signature, and every statement of the method body exactly as given; only add JML annotations. A call with modified code is rejected without running the tool (the call still counts against the budget).
+  - JML `assume` statements inside the method body are not allowed (they would make any specification verify); a call with such code is rejected like a modified program.
+  - You have a budget of {{max_tool_calls}} verify calls. Each verify result reports attempts / max_attempts. When the budget is exhausted verify refuses and you must call task_complete with your best spec.
 
   ## Tools
 
@@ -19,36 +22,26 @@ system_prompt: |-
     tool_input: {"jml_annotated_code": "<full Java source with JML>"}
     Runs OpenJML ESC and returns the result WITH error analysis:
     {"verified": bool, "return_code": int,
-     "failure_modes": [str], "repair_hints": [str], "summary": str, "raw_output": str}
+     "failure_modes": [str], "repair_hints": [str], "summary": str, "raw_output": str,
+     "attempts": int, "max_attempts": int}
     Use at every verification attempt. Read repair_hints/summary to fix failures.
     On Timeout (raw_output contains "Timeout"): STOP and simplify the spec before retrying.
     NEVER resubmit the same or structurally identical spec after a timeout.
 
-  run_spec_harness
-    tool_input: {"task_id": "<the task id>", "jml_annotated_code": "<full Java source with JML>"}
-    Evaluates JML quality on 4 metrics (all in [0.0, 1.0], 1.0 = perfect):
-      post_correctness  - @ensures holds on all test inputs
-      post_completeness - @ensures is tight enough to kill output mutants
-      pre_correctness   - @requires does not reject valid inputs
-      pre_completeness  - @requires rejects invalid inputs
-    Returns: {task_id: {post_correctness, post_completeness, pre_correctness, pre_completeness}}
-    Call after verification passes.
-
   task_complete
-    tool_input: {"summary": "<brief summary of the final spec and scores>"}
-    Mark the task complete. Call as soon as the threshold below is met.
+    tool_input: {"summary": "<brief summary of the final specification>"}
+    Mark the task complete. Call as soon as verification passes (verified=true).
 
   ## Workflow
 
   1. Analyze the Java method and infer its behavior.
   2. Synthesize JML (requires, ensures, loop_invariant, assignable, decreases as needed).
+     Aim for a spec that is both correct (true for the method) and strong (captures the
+     full input/output relationship), not a trivially-true one.
   3. Call verify.
      - verified=false -> read repair_hints/summary, refine the spec, go to 3.
      - Timeout -> simplify spec (see Timeout Strategy), go to 3.
-     - verified=true -> continue.
-  4. Call run_spec_harness.
-     - If post_correctness < {{harness_threshold}} or post_completeness < {{harness_threshold}} -> refine spec, go to 3.
-     - If post_correctness >= {{harness_threshold}} and post_completeness >= {{harness_threshold}} -> call task_complete IMMEDIATELY. Do NOT refine further.
+     - verified=true -> call task_complete IMMEDIATELY.
 
   ## Timeout Strategy
 
@@ -57,12 +50,10 @@ system_prompt: |-
   quantifiers, weaken temporarily, use \old sparingly, tighten assignable, prefer \result == expr
   over \exists). On repeated timeouts, simplify further. Never revert to a timed-out spec.
 
-  ## Spec Harness Score Enforcement
+  ## Success criterion
 
-  After run_spec_harness, act IMMEDIATELY:
-  - post_correctness >= {{harness_threshold}} AND post_completeness >= {{harness_threshold}} -> call task_complete in your VERY NEXT step. Do NOT refine further.
-  - post_correctness < {{harness_threshold}} -> @ensures fails on some inputs; fix the postcondition.
-  - post_completeness < {{harness_threshold}} -> @ensures too weak; add more constraints.
+  verify returns "verified": true. As soon as it does, submit your strongest verifying spec
+  with task_complete. There is NO spec-harness tool in this configuration.
 
   ## Example
 
@@ -77,13 +68,8 @@ system_prompt: |-
 
   Observation: {"verified": true, "return_code": 0, "failure_modes": [], "summary": "No failures detected."}
 
-  Step 3 - score:
-  {"thought": "Verification passed. Measuring spec quality.", "tool": "run_spec_harness", "tool_input": {"task_id": "maxElement_001", "jml_annotated_code": "<same verified code>"}}
-
-  Observation: {"maxElement_001": {"post_correctness": 1.0, "post_completeness": 0.75, "pre_correctness": 1.0, "pre_completeness": 0.5}}
-
-  Step 4 - threshold met, complete:
-  {"thought": "post_correctness=1.0 >= 0.5 and post_completeness=0.75 >= 0.5. Calling task_complete.", "tool": "task_complete", "tool_input": {"summary": "Verified JML for maxElement with loop invariants. post_correctness=1.0, post_completeness=0.75, pre_correctness=1.0, pre_completeness=0.5."}}
+  Step 3 - verification passed, complete:
+  {"thought": "verified=true. Submitting.", "tool": "task_complete", "tool_input": {"summary": "Verified JML for maxElement with loop invariants (requires non-empty array; ensures result is the maximum)."}}
 
   Note: task_id is provided in the task description.
 
@@ -141,7 +127,7 @@ planning:
 
     End with: <end_plan>
 
-    You have {{remaining_steps}} steps remaining.
+    You have {{remaining_tool_calls}} of {{max_tool_calls}} tool calls left.
 
     Tools:
     ```
@@ -152,5 +138,5 @@ planning:
 
 task_complete:
   pre_messages: |-
-    Summarize the final verified specification and its spec-harness scores in one short paragraph.
+    Summarize the final verified specification in one short paragraph.
   post_messages: ""

@@ -13,7 +13,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 from dataclasses import dataclass, field
-from veriact.core.utility import escape_code_brackets
+from vact.core.utility import escape_code_brackets
 
 YELLOW_HEX = "#d4b702"
 BLUE_HEX = "#1E90FF"
@@ -121,9 +121,16 @@ class Monitor:
         step_duration = step_log.duration
         self.step_durations.append(step_duration)
         out = f"[Step {len(self.step_durations)}: Duration {step_duration:.2f}s"
-        if getattr(self.tracked_model, "last_input_token_count", None) is not None:
+        # Per-thread usage of the last call (the model object is shared by parallel
+        # tasks, so its last_*_token_count attributes can belong to another task).
+        from vact.core.models import thread_last_usage
+        usage = thread_last_usage()
+        if usage and "input_tokens" in usage:
+            self.total_input_token_count += usage.get("input_tokens", 0)
+            self.total_output_token_count += usage.get("output_tokens", 0)
+        elif getattr(self.tracked_model, "last_input_token_count", None) is not None:
             self.total_input_token_count += self.tracked_model.last_input_token_count
             self.total_output_token_count += self.tracked_model.last_output_token_count
-            out += f"| In: {self.total_input_token_count:,} | Out: {self.total_output_token_count:,}"
+        out += f"| In: {self.total_input_token_count:,} | Out: {self.total_output_token_count:,}"
         out += "]"
         self.logger.log(Text(out, style="dim"), level=1)

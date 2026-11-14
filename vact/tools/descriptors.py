@@ -6,7 +6,7 @@ dispatches each tool name to a CLI subprocess (see [cli_agent.py]) and observes
 its stdout. ``forward`` is therefore a stub kept only to satisfy the Tool base.
 """
 
-from veriact.tools.base import Tool
+from vact.tools.base import Tool
 
 
 class VerifyTool(Tool):

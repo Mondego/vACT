@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""veriact tool CLI — the three agent tools as subcommands.
+"""vact tool CLI — the three agent tools as subcommands.
 
 The CLI-ReAct agent ([cli_agent.py]) drives these as subprocesses and observes
 their JSON stdout:
@@ -9,7 +9,11 @@ their JSON stdout:
     harness  score the spec on the four spec-harness metrics
     submit   record the final submission (task_complete)
 
-No attempt budget here: the agent's loop is bounded by --max-steps instead.
+The attempt budget (10 verify + run_spec_harness calls) is enforced by the agent
+(cli_agent.CLIAgent), which runs one CLI process per call. Only the JSON result is
+printed on stdout (the scorer's progress output goes to stderr). On SIGTERM / SIGINT /
+SIGHUP (the agent's tool timeout) every OpenJML process group this process started is
+killed before it exits.
 """
 
 from __future__ import annotations
@@ -19,16 +23,22 @@ import json
 import os
 import sys
 
-# Import the scorer/verifier whether run as `-m veriact.tools.cli` or by file path.
+# Import the scorer/verifier whether run as `-m vact.tools.cli` or by file path.
 try:
-    from veriact.tools.harness_tool import Task, evaluate_problem
-    from veriact.tools.verifier_tool import VerificationResult, verify_with_openjml
+    from vact.tools.harness_tool import Task, evaluate_problem, install_stop_handlers
+    from vact.tools.verifier_tool import VerificationResult, verify_with_openjml
+    from vact.tools.verifier_tool import kill_live_groups as kill_verifier_groups
 except ImportError:  # invoked directly by path (the agent does this)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from harness_tool import Task, evaluate_problem  # type: ignore
+    from harness_tool import Task, evaluate_problem, install_stop_handlers  # type: ignore
     from verifier_tool import VerificationResult, verify_with_openjml  # type: ignore
+    from verifier_tool import kill_live_groups as kill_verifier_groups  # type: ignore
 
-# Repair hints — same mapping VeriAct's analyze tool uses.
+# run_spec_harness scores the task's first 5 feedback pairs (plus all its invalid inputs), as the
+# Claude Code / Codex tools do (vact.core.data_types.HARNESS_FEEDBACK_PAIRS; the agent passes it).
+HARNESS_FEEDBACK_PAIRS = 5
+
+# Repair hints — same mapping vACT's analyze tool uses.
 REPAIR_HINTS: dict[str, str] = {
     "SyntaxError": "Fix JML syntax (missing semicolons, wrong keywords).",
     "PostconditionFailure": "The @ensures clause is logically incorrect.",
@@ -71,6 +81,8 @@ def _read(path: str) -> str:
 
 
 def _emit(obj) -> None:
+    global _LAST_EMIT
+    _LAST_EMIT = obj
     print(json.dumps(obj, indent=2))
 
 
@@ -108,7 +120,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     _resolve_openjml(_default_openjml(args.openjml))
     code = _read(args.code)
     result: VerificationResult = verify_with_openjml(
-        code, classname="Solution", output_dir=args.output_dir or "veriact_tmp"
+        code, classname="Solution", output_dir=args.output_dir or "vact_tmp"
     )
     analysis = _analyze(result.classified_errors)
     _emit(
@@ -137,7 +149,7 @@ def cmd_harness(args: argparse.Namespace) -> int:
         task,
         llm_code=code,
         openjml_path=openjml,
-        output_dir=args.output_dir or "veriact_tmp",
+        output_dir=args.output_dir or "vact_tmp",
         max_pairs=args.max_pairs,
         run_id=args.run_id or "",
     )
@@ -151,6 +163,7 @@ def cmd_harness(args: argparse.Namespace) -> int:
                 "post_completeness": scores.get("post_completeness", 0.0),
                 "pre_correctness": scores.get("pre_correctness", 0.0),
                 "pre_completeness": scores.get("pre_completeness", 0.0),
+                **({"note": scores["note"]} if scores.get("note") else {}),
             }
         }
     )
@@ -173,8 +186,36 @@ def cmd_submit(args: argparse.Namespace) -> int:
     return 0
 
 
+
+# ---------------------------------------------------------------------------
+# tool-call log: one JSON line per invocation, independent of the agent
+# ---------------------------------------------------------------------------
+
+_LAST_EMIT = None
+
+
+def _log_tool_call(log_path, record):
+    """Append one record to the tool-call log; logging must never break the tool."""
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _code_snapshot(path):
+    import hashlib
+    try:
+        with open(path) as fh:
+            code = fh.read()
+        return {"code_path": path, "code_sha256": hashlib.sha256(code.encode()).hexdigest(), "code": code}
+    except Exception:
+        return {"code_path": path}
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="veriact.tools.cli")
+    p = argparse.ArgumentParser(prog="vact.tools.cli")
     sub = p.add_subparsers(dest="command", required=True)
 
     pv = sub.add_parser("verify", help="OpenJML ESC + error analysis")
@@ -188,7 +229,8 @@ def build_parser() -> argparse.ArgumentParser:
     ph.add_argument("--task-json", dest="task_json", required=True)
     ph.add_argument("--openjml")
     ph.add_argument("--output-dir", dest="output_dir")
-    ph.add_argument("--max-pairs", type=int, default=5, dest="max_pairs")
+    ph.add_argument("--max-pairs", type=int, default=HARNESS_FEEDBACK_PAIRS, dest="max_pairs",
+                    help="feedback pairs to score (default: %(default)s)")
     ph.add_argument("--run-id", dest="run_id")
     ph.set_defaults(func=cmd_harness)
 
@@ -201,8 +243,45 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import datetime
+    import time
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    # Log next to the workspace: <workspace>/harness/tool_calls.jsonl
+    anchor = getattr(args, "code", None) or getattr(args, "out", None) or os.getcwd()
+    workspace = os.path.dirname(os.path.abspath(anchor))
+    start = time.time()
+    rec = {
+        "ts_start": datetime.datetime.now().isoformat(timespec="milliseconds"),
+        "command": args.command,
+        "run_id": getattr(args, "run_id", None),
+        **(_code_snapshot(args.code) if getattr(args, "code", None) else {}),
+    }
+    rc, err = None, None
+
+    def _log_stopped():  # the stop handler exits at once (os._exit): log the killed call first
+        _log_tool_call(os.path.join(workspace, "harness", "tool_calls.jsonl"), {
+            **rec, "ts_end": datetime.datetime.now().isoformat(timespec="milliseconds"),
+            "duration_s": round(time.time() - start, 3), "exit_code": None,
+            "error": "stopped by signal (tool timeout)", "output": None})
+
+    # On SIGTERM/SIGINT/SIGHUP (the agent's tool timeout) kill every live OpenJML group (the scorer's and
+    # the verifier's: each runs in its own session, so killing this process's group does not reach them).
+    install_stop_handlers(kill_verifier_groups, _log_stopped)
+    try:
+        rc = args.func(args)
+        return rc
+    except BaseException as exc:  # noqa: BLE001  (logged, then re-raised)
+        err = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        rec.update({
+            "ts_end": datetime.datetime.now().isoformat(timespec="milliseconds"),
+            "duration_s": round(time.time() - start, 3),
+            "exit_code": rc,
+            "error": err,
+            "output": _LAST_EMIT,
+        })
+        _log_tool_call(os.path.join(workspace, "harness", "tool_calls.jsonl"), rec)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
-"""Load environment variables for veriact.
+"""Load environment variables for vact.
 
-Loads, in order: a .env discovered from the cwd upward, and the VeriAct repo's
+Loads, in order: a .env discovered from the cwd upward, and the vACT repo's
 ``config/.env`` if present (so existing API keys keep working). Real environment
 variables always take precedence.
 """

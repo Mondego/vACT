@@ -1,4 +1,4 @@
-"""Agent memory: step tracking, message serialization, and VeriAct attempt tracking."""
+"""Agent memory: step tracking, message serialization, and vACT attempt tracking."""
 
 from __future__ import annotations
 import logging
@@ -6,9 +6,9 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, TypedDict, Union
 
-from veriact.core.models import ChatMessage, MessageRole
-from veriact.core.monitoring import AgentLogger, LogLevel
-from veriact.core.utility import AgentError, make_json_serializable
+from vact.core.models import ChatMessage, MessageRole
+from vact.core.monitoring import AgentLogger, LogLevel
+from vact.core.utility import AgentError, make_json_serializable
 
 logger = logging.getLogger(__name__)
 
