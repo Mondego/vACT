@@ -1,0 +1,302 @@
+[
+ {
+  "name": "specgen__sgb_run__claude-sonnet-4-6__zero_shot/SGB_Abs",
+  "task": {
+   "task_id": "SGB_Abs",
+   "code": "public class Solution {\n\n\tpublic static int solve(int num) {\n\t\tif (num < 0)\n\t\t\treturn -num;\n\t\telse\n\t\t\treturn num;\n\t}\n}\n",
+   "test_code": "import java.util.*;\n\npublic class Test {\n    public static void main(String[] args) {\n        Scanner scanner = new Scanner(System.in);\n        int p0 = Integer.parseInt(scanner.hasNextLine() ? scanner.nextLine().trim() : \"\");\n        int result = Solution.solve(p0);\n        System.out.println(result);\n    }\n}\n",
+   "test_inputs": [
+    {
+     "input": "-659",
+     "output": "659"
+    },
+    {
+     "input": "562",
+     "output": "562"
+    },
+    {
+     "input": "4904",
+     "output": "4904"
+    },
+    {
+     "input": "-687",
+     "output": "687"
+    },
+    {
+     "input": "770",
+     "output": "770"
+    },
+    {
+     "input": "1755",
+     "output": "1755"
+    },
+    {
+     "input": "5",
+     "output": "5"
+    },
+    {
+     "input": "-866",
+     "output": "866"
+    },
+    {
+     "input": "-2147483648",
+     "output": "-2147483648"
+    },
+    {
+     "input": "3129",
+     "output": "3129"
+    }
+   ],
+   "generated_test_cases": [],
+   "class_name": "Solution",
+   "test_name": "Test",
+   "javadoc": "N/A",
+   "category": "branch",
+   "origin_id": "Abs",
+   "invalid_inputs": [],
+   "v2": {
+    "suite": "v2",
+    "pool_size": 100,
+    "t_minus_validated": 0,
+    "t_minus_classes": 0,
+    "t_minus_per_class": 3,
+    "t_minus_split": true,
+    "list": "evaluation",
+    "n": 10,
+    "pair_sources": [
+     "evosuite",
+     "evosuite",
+     "evosuite",
+     "evosuite",
+     "evosuite",
+     "evosuite",
+     "original",
+     "evosuite",
+     "boundary",
+     "evosuite"
+    ]
+   }
+  },
+  "code": "public class Solution {\n\n    /*@ public normal_behavior\n      @   requires num < 0;\n      @   ensures \\result == -num;\n      @ also\n      @ public normal_behavior\n      @   requires num >= 0;\n      @   ensures \\result == num;\n      @ also\n      @ public normal_behavior\n      @   requires true;\n      @   ensures \\result >= 0;\n      @   ensures \\result == (num < 0 ? -num : num);\n      @*/\n    public static /*@ pure @*/ int solve(int num) {\n        if (num < 0)\n            return -num;\n        else\n            return num;\n    }\n}"
+ },
+ {
+  "name": "specgen__sgb_run__claude-sonnet-4-6__zero_shot/SGB_IntCube",
+  "task": {
+   "task_id": "SGB_IntCube",
+   "code": "public class Solution {\n\n    public static int solve(int x) {\n        boolean neg = false;\n        if (x < 0) {\n            neg = true;\n            x = -x;\n        }\n        int res = 0;\n        for (int i = 0; i < x; i++) {\n            for (int j = 0; j < x; j++) {\n                for (int k = 0; k < x; k++) {\n                    res = res + 1;\n                }\n            }\n        }\n        return (neg ? -res : res);\n    }\n\n}\n",
+   "test_code": "import java.util.*;\n\npublic class Test {\n    public static void main(String[] args) {\n        Scanner scanner = new Scanner(System.in);\n        int p0 = Integer.parseInt(scanner.hasNextLine() ? scanner.nextLine().trim() : \"\");\n        int result = Solution.solve(p0);\n        System.out.println(result);\n    }\n}\n",
+   "test_inputs": [
+    {
+     "input": "-87",
+     "output": "-658503"
+    },
+    {
+     "input": "89",
+     "output": "704969"
+    },
+    {
+     "input": "-2147483648",
+     "output": "0"
+    },
+    {
+     "input": "-1",
+     "output": "-1"
+    },
+    {
+     "input": "-142",
+     "output": "-2863288"
+    },
+    {
+     "input": "-6",
+     "output": "-216"
+    },
+    {
+     "input": "-45",
+     "output": "-91125"
+    },
+    {
+     "input": "-41",
+     "output": "-68921"
+    },
+    {
+     "input": "-9",
+     "output": "-729"
+    },
+    {
+     "input": "25",
+     "output": "15625"
+    }
+   ],
+   "generated_test_cases": [],
+   "class_name": "Solution",
+   "test_name": "Test",
+   "javadoc": "N/A",
+   "category": "nested",
+   "origin_id": "IntCube",
+   "invalid_inputs": [
+    {
+     "inputs": {
+      "x": 2147483647
+     },
+     "exception": "timeout",
+     "sources": [
+      "generator:max:x",
+      "t4_search:ref_timeout"
+     ]
+    },
+    {
+     "inputs": {
+      "x": 431704
+     },
+     "exception": "timeout",
+     "sources": [
+      "t4_search:ref_timeout"
+     ]
+    },
+    {
+     "inputs": {
+      "x": 758356
+     },
+     "exception": "timeout",
+     "sources": [
+      "t4_search:ref_timeout"
+     ]
+    },
+    {
+     "inputs": {
+      "x": 392029
+     },
+     "exception": "timeout",
+     "sources": [
+      "t4_search:ref_timeout"
+     ]
+    }
+   ],
+   "v2": {
+    "suite": "v2",
+    "pool_size": 100,
+    "t_minus_validated": 7,
+    "t_minus_classes": 2,
+    "t_minus_per_class": 3,
+    "t_minus_split": true,
+    "list": "evaluation",
+    "n": 10,
+    "pair_sources": [
+     "search-fill",
+     "search-fill",
+     "boundary",
+     "original",
+     "search-fill",
+     "search-fill",
+     "search-fill",
+     "search-fill",
+     "search-fill",
+     "search-fill"
+    ]
+   }
+  },
+  "code": "public class Solution {\n\n    /*@ public normal_behavior\n      @ requires x >= 0;\n      @ ensures \\result == x * x * x;\n      @ also\n      @ public normal_behavior\n      @ requires x < 0;\n      @ ensures \\result == -((-x) * (-x) * (-x));\n      @ also\n      @ public normal_behavior\n      @ requires true;\n      @ ensures \\result == x * x * x;\n      @*/\n    public static int solve(int x) {\n        boolean neg = false;\n        if (x < 0) {\n            neg = true;\n            x = -x;\n        }\n        int res = 0;\n        /*@ loop_invariant i >= 0 && i <= x;\n          @ loop_invariant res == i * x * x;\n          @ decreases x - i;\n          @*/\n        for (int i = 0; i < x; i++) {\n            /*@ loop_invariant j >= 0 && j <= x;\n              @ loop_invariant res == i * x * x + j * x;\n              @ decreases x - j;\n              @*/\n            for (int j = 0; j < x; j++) {\n                /*@ loop_invariant k >= 0 && k <= x;\n                  @ loop_invariant res == i * x * x + j * x + k;\n                  @ decreases x - k;\n                  @*/\n                for (int k = 0; k < x; k++) {\n                    res = res + 1;\n                }\n            }\n        }\n        return (neg ? -res : res);\n    }\n\n}"
+ },
+ {
+  "name": "specgen__fb_run__claude-sonnet-4-6__zero_shot/FB_FrontAndRear",
+  "task": {
+   "task_id": "FB_FrontAndRear",
+   "code": "public class Solution {\n\n    public static int[] solve(int[] testTup) {\n        int front = testTup[0];\n        int rear = testTup[testTup.length - 1];\n        return new int[] {front, rear};\n    }\n}\n\n",
+   "test_code": "import java.util.*;\n\npublic class Test {\n    public static void main(String[] args) {\n        Scanner scanner = new Scanner(System.in);\n        int[] p0 = java.util.Arrays.stream(scanner.nextLine().trim().split(\"\\\\s+\")).mapToInt(Integer::parseInt).toArray();\n        var result = Solution.solve(p0);\n        System.out.println(java.util.Arrays.stream(result).mapToObj(Integer::toString).collect(java.util.stream.Collectors.joining(\" \")));\n    }\n}",
+   "test_inputs": [
+    {
+     "input": "1 2 -10 -2147483648 0 5 1 -1 10 168637 -1 0 9 -10 0 -7 342555 -1 7",
+     "output": "1 7"
+    },
+    {
+     "input": "1 0 0 1 -9 5 -2147483648 -6 2147483646 100 0 25 6 3 0 -9 91 -7 2147483647 -96 1 24 0 -2147483648 -2147483648 -1 -2 16 -74 25 5 9 -62 75 8 -1 7 -20 -3 2 -2147483647",
+     "output": "1 -2147483647"
+    },
+    {
+     "input": "2 2",
+     "output": "2 2"
+    },
+    {
+     "input": "-1 536 -1 0 -1 -1215",
+     "output": "-1 -1215"
+    },
+    {
+     "input": "-1 11 338 0 2 1",
+     "output": "-1 1"
+    },
+    {
+     "input": "4 5 6 7 10 11",
+     "output": "4 11"
+    },
+    {
+     "input": "1290 0 -767 2147483647",
+     "output": "1290 2147483647"
+    },
+    {
+     "input": "2147483646 10 5 -10 -1 2147483646 -8 8 0 70 1 7 -1 3 2147483646 -45 1 5 -2 7 -1 2147483646 1 99 2 -2147483648 -2147483648 -1 8",
+     "output": "2147483646 8"
+    },
+    {
+     "input": "-1 5 6 7 10",
+     "output": "-1 10"
+    },
+    {
+     "input": "-2147483647 9",
+     "output": "-2147483647 9"
+    }
+   ],
+   "generated_test_cases": [],
+   "class_name": "Solution",
+   "test_name": "Test",
+   "javadoc": "N/A",
+   "category": "sequential",
+   "origin_id": "MBJP/710",
+   "invalid_inputs": [
+    {
+     "inputs": {
+      "testTup": null
+     },
+     "exception": "java.lang.NullPointerException",
+     "sources": [
+      "generator:null:testTup",
+      "legacy:null_testTup",
+      "evosuite"
+     ]
+    },
+    {
+     "inputs": {
+      "testTup": []
+     },
+     "exception": "java.lang.ArrayIndexOutOfBoundsException",
+     "sources": [
+      "generator:empty:testTup",
+      "legacy:empty_testTup"
+     ]
+    }
+   ],
+   "v2": {
+    "suite": "v2",
+    "pool_size": 100,
+    "t_minus_validated": 2,
+    "t_minus_classes": 2,
+    "t_minus_per_class": 3,
+    "t_minus_split": true,
+    "list": "evaluation",
+    "n": 10,
+    "pair_sources": [
+     "search-fill",
+     "search-fill",
+     "evosuite",
+     "evosuite",
+     "search-fill",
+     "search-fill",
+     "search-fill",
+     "search-fill",
+     "search-fill",
+     "search-fill"
+    ]
+   }
+  },
+  "code": "public class Solution {\n\n    /*@\n      @ public normal_behavior\n      @   requires testTup != null;\n      @   requires testTup.length >= 1;\n      @   ensures \\result != null;\n      @   ensures \\result.length == 2;\n      @   ensures \\result[0] == testTup[0];\n      @   ensures \\result[1] == testTup[testTup.length - 1];\n      @   assignable \\nothing;\n      @*/\n    public static int[] solve(int[] testTup) {\n        int front = testTup[0];\n        int rear = testTup[testTup.length - 1];\n        return new int[] {front, rear};\n    }\n}"
+ }
+]
